@@ -1,0 +1,2 @@
+{"name": "example-system-prompt", "public": true, "prefix_only": true,
+ "messages": [{"role": "system", "content": "You are a helpful assistant. Answer concisely."}]}

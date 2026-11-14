@@ -1,0 +1,19 @@
+Tachyon-v100
+Copyright 2026 blueqat Inc.
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes material from the following third-party projects
+(full list and license texts in THIRD_PARTY_LICENSES.md):
+
+* ggml / llama.cpp (MIT License, Copyright (c) 2023-2026 The ggml authors)
+  - kernels/tables.cuh: dequantization lookup tables copied from ggml/src/ggml-common.h
+  - kernels/quant.cuh, kernels/g3.cuh, src/gguf.rs, src/qtype.rs: quantized block layouts
+    re-implemented to match ggml-quants.c / ggml-common.h
+
+* Qwen3.8-27B chat template (Apache License 2.0, Copyright 2026 Alibaba Cloud)
+  - tests/data/qwen38/chat_template.jinja (unmodified, test fixture)
+
+Model weights are not included. Qwen3.8-27B and Qwen3.6-35B-A3B are released by the
+Qwen team under the Apache License 2.0; their GGUF conversions are published by
+unsloth and ggml-org on Hugging Face under the same license.

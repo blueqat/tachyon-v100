@@ -1,0 +1,10 @@
+target/
+.venv/
+__pycache__/
+*.gguf
+*.safetensors
+weights/
+golden/
+logs/
+keys.json
+*.key

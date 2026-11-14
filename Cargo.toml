@@ -1,0 +1,35 @@
+[package]
+name = "tachyon-v100"
+version = "0.1.0"
+edition = "2021"
+description = "LLM inference engine for NVIDIA V100 (sm_70): Rust + hand-written CUDA kernels"
+license = "Apache-2.0"
+repository = "https://github.com/blueqat/tachyon-v100"
+keywords = ["llm", "inference", "cuda", "v100", "gguf"]
+categories = ["science"]
+publish = false
+
+[dependencies]
+memmap2 = "0.9"
+# 語の切り分けと chat_template（src/tokenizer.rs・src/template.rs）
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+minijinja = { version = "3", features = ["loop_controls", "preserve_order", "serde"] }
+minijinja-contrib = { version = "3", features = ["pycompat"] }
+# float_roundtrip: 数を正しく丸めて読む（既定の読み方は 1 ulp ずれることがあり、道具の引数の 1.602176634e-19 が
+# 1.6021766340000001e-19 になって Python の json と描いた文が変わった。2026-11-10 の見直し）
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+# OpenAI 互換の口（src/server/）。axum 0.8・tokio 1。鍵の sha256 と重みの版は sha2
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+tokio-stream = "0.1"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+# 画像の入力（src/vision.rs）: jpeg・png・webp・gif を読むだけ
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+
+[dev-dependencies]
+# 口の試し（tests/server_api.rs）。127.0.0.1 だけなので TLS・proxy は要らない
+reqwest = { version = "0.13", default-features = false }
+
+[profile.release]
+debug = 1

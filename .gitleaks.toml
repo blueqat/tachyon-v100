@@ -1,0 +1,7 @@
+# gitleaks config: default rules + the fake API keys used by the tests (tests/server_api.rs, src/server/auth.rs)
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "fake API keys in tests (not credentials)"
+regexes = ['''sk-(test|wrong|not-a-real)-[A-Za-z0-9-]+''', '''sk-(a{16}|b{16}|c{16})''']
