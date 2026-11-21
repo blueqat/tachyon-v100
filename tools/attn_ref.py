@@ -23,6 +23,7 @@ lcpp: llama.cpp（CPU）が本物の文で書き出した 16 層ぶんの射影�
 """
 import os
 import json
+import math
 import subprocess
 import sys
 import tempfile
@@ -41,6 +42,26 @@ TOL = 2e-3
 
 class HP:
     h, hkv, n_rot, sections, theta, eps = 24, 4, 64, (11, 11, 10, 0), 1e7, 1e-6
+    yarn = None  # (freq_scale, ext_factor, mscale, corr0, corr1)。None は YaRN なし
+
+
+def yarn_params(factor, orig, n_rot=64, base=1e7, attn_factor=1.0, beta_fast=32.0, beta_slow=1.0):
+    """ggml_rope_yarn_corr_dims と同じ（src/attn.rs の Yarn::new）"""
+    c = lambda b: n_rot * math.log(orig / (b * 2 * math.pi)) / (2 * math.log(base))
+    return (1.0 / factor, 1.0, attn_factor, max(0.0, math.floor(c(beta_fast))), min(n_rot - 1.0, math.ceil(c(beta_slow))))
+
+
+def hf_yarn_inv_freq(factor, orig, n_rot=64, base=1e7, beta_fast=32.0, beta_slow=1.0):
+    """HF transformers の _compute_yarn_parameters（truncate=True）を float64 で。返り値 (inv_freq, attention_factor)"""
+    pos_freqs = base ** (np.arange(0, n_rot, 2, dtype=np.float64) / n_rot)
+    extra, inter = 1.0 / pos_freqs, 1.0 / (factor * pos_freqs)
+    fcd = lambda r: (n_rot * math.log(orig / (r * 2 * math.pi))) / (2 * math.log(base))
+    low, high = max(math.floor(fcd(beta_fast)), 0), min(math.ceil(fcd(beta_slow)), n_rot - 1)
+    if low == high:
+        high += 0.001
+    ramp = np.clip((np.arange(n_rot // 2, dtype=np.float64) - low) / (high - low), 0, 1)
+    ef = 1 - ramp
+    return inter * (1 - ef) + extra * ef, 0.1 * math.log(factor) + 1.0
 
 
 # ---------------------------------------------------------------- 手本
@@ -76,6 +97,15 @@ def rope_cs(pos4, hp):
     ts = np.power(F32(hp.theta), F32(-2.0 / hp.n_rot), dtype=F32)
     freq = np.power(ts, np.arange(half, dtype=F32), dtype=F32)
     ang = (pos4[:, rope_comp(hp.n_rot, hp.sections)].astype(F32) * freq).astype(F32)
+    if hp.yarn is not None:  # ggml の rope_yarn（角度は f32 のまま混ぜる。大きさは float64）
+        fs, ext, msc, c0, c1 = hp.yarn
+        y = (np.arange(half, dtype=F32) - F32(c0)) / F32(max(0.001, c1 - c0))
+        mix = ((1 - np.clip(y, 0, 1)) * F32(ext)).astype(F32)
+        ang = (ang * F32(fs) * (1 - mix) + ang * mix).astype(F32)
+        if ext != 0:
+            msc = msc * (1 + 0.1 * math.log(1 / fs))
+        a = ang.astype(np.float64)
+        return np.cos(a) * msc, np.sin(a) * msc
     a = ang.astype(np.float64)
     return np.cos(a), np.sin(a)
 
@@ -172,6 +202,7 @@ def gpu_run(name, seqs, pages, n_pages, qf, kf, vf, pos, nw, hp=HP, kv8=False, o
     host_lens: 列の長さの CPU の写し（kv_len_host）を渡して自動の split を列ごとの長さで決める（False は max_kv だけで決める前のやり方）"""
     qnw, knw = nw
     case = dict(h=hp.h, hkv=hp.hkv, n_rot=hp.n_rot, sections=list(hp.sections), theta=hp.theta, eps=hp.eps,
+                yarn=list(hp.yarn) if hp.yarn is not None else None,
                 kv8=int(kv8), out_f16=int(out_f16), kv_chunk=kv_chunk, pos_mode=pos_mode, n_pages=n_pages,
                 gate=int(gate), host_lens=int(host_lens), seqs=[dict(kv_len=l, q_len=q, pages=p) for (l, q), p in zip(seqs, pages)])
     ks = vs = None
@@ -211,7 +242,7 @@ def gather_kv(kc, vc, ks, vs, pg, l):
 
 
 def run_case(name, seqs, rng, nw, hp=HP, kv8=False, out_f16=False, kv_chunk=-1, pos_mode=1, gate=True,
-             xscale=1.0, f32mm=False, host_lens=True):
+             xscale=1.0, f32mm=False, host_lens=True, pos_off=0, rope_tol=2e-3):
     """seqs: [(kv_len, q_len)]。全トークンの射影の出力をでたらめに作り、GPU と手本を比べる"""
     t_start = time.time()
     lens = [l for l, _ in seqs]
@@ -219,7 +250,7 @@ def run_case(name, seqs, rng, nw, hp=HP, kv8=False, out_f16=False, kv_chunk=-1, 
     qf = (xscale * rng.standard_normal((NQ, hp.h * 2 * D))).astype(F32)   # q は新しいトークンの分だけ
     kf = (xscale * rng.standard_normal((N, hp.hkv * D))).astype(F32)
     vf = rng.standard_normal((N, hp.hkv * D)).astype(F32)
-    pos = np.concatenate([np.arange(l) for l in lens]).astype(np.int32)
+    pos = np.concatenate([np.arange(l) + pos_off for l in lens]).astype(np.int32)
     if pos_mode == 4:  # 画像のような t・h・w が別々の位置
         p4 = np.stack([pos, pos + rng.integers(0, 50, N), pos // 2 + rng.integers(0, 9, N), rng.integers(0, 5, N)], axis=1)
         pos = p4.astype(np.int32).reshape(-1)
@@ -260,7 +291,7 @@ def run_case(name, seqs, rng, nw, hp=HP, kv8=False, out_f16=False, kv_chunk=-1, 
     out_tol = TOL + (5e-4 if out_f16 else 0)
     # int8: 丸めの 0.5 に、f32 の RoPE の角度の揺れ（powf の 1〜2 ulp × 位置）で丸めが隣に転ぶ分を足す
     int8_tol = 0.5 + 127 * (1e-4 + 1.5e-8 * max(lens))
-    good = res["rope"] < 2e-3 and res["attn"] < out_tol and (worst_int8 <= int8_tol if kv8 else res["kv"] < 2e-3)
+    good = res["rope"] < rope_tol and res["attn"] < out_tol and (worst_int8 <= int8_tol if kv8 else res["kv"] < rope_tol)
     kvs = f"int8 誤差/係数 {worst_int8:.3f}" if kv8 else f"kv {res['kv']:.1e}"
     print(f"{'OK' if good else 'NG'} {name:24s} rope {res['rope']:.1e}  {kvs}  attn {res['attn']:.1e} (L2 {res['attn_l2']:.1e})"
           f"  全部 f64 との差 {res['full']:.1e}  [{info.split(': ', 1)[1]}]  GPU {t_gpu - t_start:.1f}s 手本 {time.time() - t_gpu:.1f}s",
@@ -385,8 +416,32 @@ def main():
         oks.append(run_case("prefill T=8192", [(8192, 8192)], rng, nw, f32mm=True))
         oks.append(run_case("prefill T=8192 kv8", [(8192, 8192)], rng, nw, kv8=True, f32mm=True))
         oks.append(run_case("続き 2048 @ 30000", [(32000, 2048)], rng, nw, f32mm=True))
+    if which == "yarn":  # YaRN（factor 4・元 262144）: HF の式と ggml の式が同じか、GPU の rope と attention が手本と合うか
+        fs, ext, msc, c0, c1 = yarn_params(4.0, 262144)
+        inv, af = hf_yarn_inv_freq(4.0, 262144)
+        base_f = 1e7 ** (-np.arange(0, 64, 2) / 64)
+        mix = (1 - np.clip((np.arange(32) - c0) / max(0.001, c1 - c0), 0, 1)) * ext
+        gg_f = base_f * fs * (1 - mix) + base_f * mix
+        d_inv = float(np.max(np.abs(gg_f / inv - 1)))
+        d_af = abs(msc * (1 + 0.1 * math.log(1 / fs)) - af)
+        print(f"YaRN corr {c0}..{c1}  mscale {af:.6f}  HF と ggml の周波数の差 {d_inv:.1e}・大きさの差 {d_af:.1e}")
+        oks.append(d_inv < 1e-12 and d_af < 1e-12)
+        class HY(HP):
+            yarn = (fs, ext, msc, c0, c1)
+        oks.append(run_case("yarn mix", mix_cases(rng), rng, nw, hp=HY))
+        # 70 万〜100 万の位置では f32 の角度（pos·powf）の 1ulp の違い（CUDA の powf と numpy）で rope の差が 1e-2 まで出る。
+        # YaRN なしでも同じだけ出る（下の「比べ」）ので、ここだけ rope の許しを 3e-2 に。attention の出力は 1e-4 のまま
+        oks.append(run_case("yarn なし @ 1M（比べ）", [(4000, 3), (777, 3)], rng, nw, pos_off=1000000, rope_tol=3e-2))
+        oks.append(run_case("yarn decode @ 700K", [(3000, 1), (900, 1), (5000, 1)], rng, nw, hp=HY, pos_off=700000, rope_tol=3e-2))
+        oks.append(run_case("yarn verify 3 @ 1M", [(4000, 3), (777, 3)], rng, nw, hp=HY, pos_off=1000000, rope_tol=3e-2))
+        oks.append(run_case("yarn decode @ 20K", [(3000, 1), (900, 1), (5000, 1)], rng, nw, hp=HY, pos_off=20000))
+        oks.append(run_case("yarn kv8 @ 4K", [(3000, 1), (2000, 5)], rng, nw, hp=HY, kv8=True, pos_off=4000))
     print(f"{sum(oks)}/{len(oks)} OK")
     sys.exit(0 if all(oks) else 1)
+
+
+def mix_cases(rng):
+    return [(547, 547), (1300, 300), (5000, 1), (777, 3), (64, 1), (1, 1), (65, 2), (129, 17)]
 
 
 if __name__ == "__main__":

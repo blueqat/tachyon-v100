@@ -1,7 +1,7 @@
 //! 依頼（JSON）を読んで確かめる。誤りは 400（param と code つき。文は英語＝OpenAI の口に合わせる）。
 //! 既定の値（docs/API.md 3・3.5）: reasoning_effort は medium を明示、preserve_thinking はふつうの会話は false・tools があれば true。
 use super::sampler::SamplingParams;
-use crate::template::{normalize_messages, ChatOptions, TemplateError, EFFORTS};
+use crate::template::{effort_ok, efforts, is_inkling, normalize_messages, ChatOptions, TemplateError};
 use serde_json::{Map, Value as Json};
 
 /// 依頼の大きさの上限（2026-11-10 の見直し: 描いて語に切る前に、バイトで早めに断る）
@@ -251,14 +251,21 @@ pub fn parse_kwargs(o: &Map<String, Json>, add_generation_prompt: bool) -> Resul
             }
             _ => opts.reasoning_effort = Some(e.clone()),
         },
-        Some(_) => return Err(req_err("invalid_type", "reasoning_effort", "reasoning_effort must be a string")),
+        Some(Json::Number(n)) if is_inkling() => {
+            let e = format!("num:{}", n.as_f64().unwrap_or(-1.0));
+            match &opts.reasoning_effort {
+                Some(k) if *k != e => return Err(req_err("invalid_value", "reasoning_effort", "reasoning_effort and chat_template_kwargs.reasoning_effort differ")),
+                _ => opts.reasoning_effort = Some(e),
+            }
+        }
+        Some(_) => return Err(req_err("invalid_type", "reasoning_effort", if is_inkling() { "reasoning_effort must be a string or a number in [0, 0.99]" } else { "reasoning_effort must be a string" })),
     }
     if let Some(e) = &opts.reasoning_effort {
-        if !EFFORTS.contains(&e.as_str()) {
+        if !effort_ok(e) {
             return Err(req_err(
                 "invalid_value",
                 "chat_template_kwargs.reasoning_effort",
-                format!("reasoning_effort must be one of {} (got {e:?})", EFFORTS.join(", ")),
+                format!("reasoning_effort must be one of {} (got {e:?})", efforts().join(", ")),
             ));
         }
     }
@@ -268,7 +275,7 @@ pub fn parse_kwargs(o: &Map<String, Json>, add_generation_prompt: bool) -> Resul
 /// テンプレートの誤り → 文（英語）
 pub fn template_msg(e: &TemplateError) -> String {
     match e {
-        TemplateError::BadEffort(v) => format!("reasoning_effort must be one of {} (got {v:?})", EFFORTS.join(", ")),
+        TemplateError::BadEffort(v) => format!("reasoning_effort must be one of {} (got {v:?})", efforts().join(", ")),
         TemplateError::Raised(m) => m.clone(),
         TemplateError::BadRequest(m) => m.clone(),
         TemplateError::Template(m) => format!("could not render the conversation: {m}"),

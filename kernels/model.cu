@@ -298,8 +298,25 @@ __global__ void __launch_bounds__(GS_NT) gdn_step_kernel(const float* __restrict
 
 // RoPE の cos・sin の表（デコードの 1 歩で 16 層が同じ角度を使う）: tab[t][i] = (cos, sin)(pos · theta_scale^i)、i < n_rot/2。
 // 角度と sincosf は attn.cu の rope_norm_kernel と同じ式（pos_mode 1: 文字だけ。区画 3 は位置 0）
+// YaRN（attn.cu の rope_yarn_cs と同じ式・ggml-cuda の rope_yarn と同じ）
+struct RopeYarn {
+    float freq_scale, ext_factor, mscale, corr0, corr1;
+};
+static __device__ __forceinline__ void rope_yarn_cs(float theta_extrap, int i, const RopeYarn y, float* cs, float* sn) {
+    const float theta_interp = y.freq_scale * theta_extrap;
+    float theta = theta_interp, mscale = y.mscale;
+    if (y.ext_factor != 0.0f) {
+        const float r = (float(i) - y.corr0) / fmaxf(0.001f, y.corr1 - y.corr0);
+        const float ramp_mix = (1.0f - fminf(1.0f, fmaxf(0.0f, r))) * y.ext_factor;
+        theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+        mscale *= 1.0f + 0.1f * logf(1.0f / y.freq_scale);
+    }
+    *cs = cosf(theta) * mscale;
+    *sn = sinf(theta) * mscale;
+}
+
 __global__ void rope_tab_kernel(const int* __restrict__ pos, int n, int n_rot, int s0, int s1, int s2, int s3, float theta_scale,
-                                float2* __restrict__ tab) {
+                                float2* __restrict__ tab, const bool yarn, const RopeYarn yp) {
     const int half = n_rot / 2;
     const int id = blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= n * half) return;
@@ -316,7 +333,8 @@ __global__ void rope_tab_kernel(const int* __restrict__ pos, int n, int n_rot, i
     const int p = c == 3 ? 0 : pos[t];
     const float th = float(p) * powf(theta_scale, float(i));
     float sn, cs;
-    sincosf(th, &sn, &cs);
+    if (yarn) rope_yarn_cs(th, i, yp, &cs, &sn);
+    else sincosf(th, &sn, &cs);
     tab[id] = make_float2(cs, sn);
 }
 
@@ -538,12 +556,16 @@ int infer_m_gdn_step(const float* c, int64_t c_ld, const float* z, int64_t z_ld,
 }
 
 // RoPE の表 tab[n][n_rot/2]（float2 = cos, sin）。theta_scale は attn.cu と同じく CPU で powf(theta, -2/n_rot)
-int infer_m_rope_tab(const int* pos, int n, int n_rot, const int* sections, float theta, void* tab, cudaStream_t s) {
+// yarn: CPU の float[5]（freq_scale, ext_factor, mscale, corr0, corr1）。null か (1, 0, 1, …) なら前と同じ式
+int infer_m_rope_tab(const int* pos, int n, int n_rot, const int* sections, float theta, const float* yarn, void* tab, cudaStream_t s) {
     if (n_rot % 16 || n <= 0) return n <= 0 ? 0 : -2;
     const float theta_scale = powf(theta, -2.0f / float(n_rot));
     const int items = n * (n_rot / 2);
+    RopeYarn yp{1.0f, 0.0f, 1.0f, 0.0f, 0.0f};
+    if (yarn) yp = RopeYarn{yarn[0], yarn[1], yarn[2], yarn[3], yarn[4]};
+    const bool on = yp.freq_scale != 1.0f || yp.ext_factor != 0.0f || yp.mscale != 1.0f;
     rope_tab_kernel<<<(items + 127) / 128, 128, 0, s>>>(pos, n, n_rot, sections[0], sections[1], sections[2], sections[3], theta_scale,
-                                                         static_cast<float2*>(tab));
+                                                         static_cast<float2*>(tab), on, yp);
     return int(cudaGetLastError());
 }
 

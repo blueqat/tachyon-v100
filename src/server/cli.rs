@@ -4,6 +4,8 @@
 //!         [--model-name qwen3.8-27b] [--weights GGUF | --weights-sha HEX] [--max-context 262144] [--max-output 131072]
 //!         [--default-max-tokens 32768] [--max-queue 64] [--max-running 32] [--no-fim-stop]
 //!         [--fake-delay-ms 1] [--fake-first-ms 0] [--step-tokens 512] [--prefill-chunk 256]
+//!         [--prefix-owner-accounts a,b]（そのアカウントの頭の使い回しを x-tachyon-prefix-owner の利用者ごとに分ける）
+//!         [--ink-nothink-floor-tokens 4096] [--ink-nothink-floor-effort low] [--ink-nothink-floor-budget 2048]（Inkling: 長い・文書つきの考えなしの依頼に考えを入れる）
 //!         [--metrics-key]（/metrics にも admin の鍵）[--allow-plain-keys]（平文の鍵の設定で起こす。試しだけ）
 //!   hash-key   標準入力の鍵 1 行 → sha256（keys.json の keys_sha256 に書く値。鍵はシェルの履歴にも ps にも残らない）
 //!   gen-key    鍵を作る（鍵は標準出力に 1 行・sha256 は標準エラーに）
@@ -129,6 +131,10 @@ pub fn server_config(a: &ServeArgs, sha: String) -> Result<ServerConfig, String>
         max_inflight: a.n("max-inflight", d.max_inflight)?,
         fim_stops: !a.flag("no-fim-stop"),
         metrics_key: a.flag("metrics-key"),
+        prefix_owner_accounts: a.s("prefix-owner-accounts").map(|v| v.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default(),
+        ink_nothink_floor_tokens: a.n("ink-nothink-floor-tokens", d.ink_nothink_floor_tokens)?,
+        ink_nothink_floor_effort: a.s("ink-nothink-floor-effort").unwrap_or(d.ink_nothink_floor_effort.as_str()).to_string(),
+        ink_nothink_floor_budget: a.n("ink-nothink-floor-budget", d.ink_nothink_floor_budget)?,
         stall_timeout: Duration::from_secs(a.n("stall-secs", d.stall_timeout.as_secs() as usize)? as u64),
         ..d
     })
@@ -157,6 +163,13 @@ pub fn serve_main(args: &[String], make_engine: Option<MakeEngine>) -> Result<()
         return Err("本物のエンジンには重みの版が要る: --weights <GGUF>（<GGUF>.sha256 か計算）か --weights-sha <16 進>".into());
     }
     let cfg = server_config(&a, sha)?;
+    // ⛔ 名前の打ち違いで黙って分けないことがないように、載せたアカウントは鍵の設定に要る（--no-auth のときは "local"）
+    if let Some(x) = cfg.prefix_owner_accounts.iter().find(|x| !auth.accounts.iter().any(|ac| ac.name == **x)) {
+        return Err(format!("--prefix-owner-accounts の {x:?} は鍵の設定に無いアカウント"));
+    }
+    if !cfg.prefix_owner_accounts.is_empty() {
+        eprintln!("頭の使い回しを利用者ごとに分けるアカウント（x-tachyon-prefix-owner）: {}", cfg.prefix_owner_accounts.join(", "));
+    }
     let backend: Arc<dyn Backend> = if a.flag("fake") {
         let fc = FakeConfig {
             delay: Duration::from_millis(a.n("fake-delay-ms", 1)? as u64),

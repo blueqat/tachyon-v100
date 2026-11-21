@@ -185,6 +185,35 @@ impl Prepared {
             }
         }
     }
+    /// 位置 pos の 1 語（乱数の取り方は hash_rng_on で選ぶ）。
+    /// 切（既定）: 一様な数 uniform(seed, pos) で累積分布を引く（前と同じ）。
+    /// 入（TACHYON_HASH_RNG=1）: Gumbel-max。argmax_x [ln w_x + G(seed, pos, TAG_SAMPLE, x)]（G は src/spec.rs の Philox。GPU の下書きも同じ式）
+    pub fn pick(&self, p: &SamplingParams, pos: u64) -> u32 {
+        if hash_rng_on() {
+            self.gumbel_pick(p.seed, pos)
+        } else {
+            self.draw(uniform(p.seed, pos), None)
+        }
+    }
+    /// Gumbel-max で 1 語（同点は前の候補＝大きい順で先の物）。出る語の分布は w に比例
+    pub fn gumbel_pick(&self, seed: u64, pos: u64) -> u32 {
+        match self {
+            Prepared::One(x) => *x,
+            Prepared::Weighted(c, w) => {
+                let mut best = (f64::NEG_INFINITY, c[0]);
+                for (&x, &wi) in c.iter().zip(w) {
+                    if !(wi > 0.0) {
+                        continue;
+                    }
+                    let v = wi.ln() + crate::spec::gumbel(seed, pos, crate::spec::TAG_SAMPLE, x);
+                    if v > best.0 {
+                        best = (v, x);
+                    }
+                }
+                best.1
+            }
+        }
+    }
     /// 一様な数 u（[0, 1)）で 1 語。skip の語は除いて残りで割り直す（下書きが外れたときの残りの分布）
     pub fn draw(&self, u: f64, skip: Option<u32>) -> u32 {
         match self {
@@ -294,7 +323,7 @@ pub fn prepare(logits: &[f32], valid: usize, p: &SamplingParams, hist: &History)
 /// logits から 1 語選ぶ。valid: 選んでよい番号の上限（tokenizer の語の数。GGUF の余りの [PAD…] は選ばない）。
 /// pos: 乱数の位置（列の中の位置）
 pub fn sample(logits: &[f32], valid: usize, p: &SamplingParams, hist: &History, pos: u64) -> u32 {
-    prepare(logits, valid, p, hist).draw(uniform(p.seed, pos), None)
+    prepare(logits, valid, p, hist).pick(p, pos)
 }
 
 /// GPU の上位 K 語の候補（model::Model::cands）から、prepare と同じ分布を作る。候補だけでは同じにできない時は None
@@ -446,16 +475,22 @@ fn prepare_cands_b(c: &RowCands, bound: f32, p: &SamplingParams, hist: &History,
 
 /// sample の候補版（None なら手元で logits 全部から）
 pub fn sample_cands(c: &RowCands, p: &SamplingParams, hist: &History, pos: u64) -> Option<u32> {
-    prepare_cands(c, p, hist).map(|pr| pr.draw(uniform(p.seed, pos), None))
+    prepare_cands(c, p, hist).map(|pr| pr.pick(p, pos))
 }
 
 /// spec_row の分布を作る所だけ分けた物（prepare か prepare_cands の結果で受け取りを決める）
 pub fn spec_row_prepared(pr: Prepared, p: &SamplingParams, pos: u64, draft: Option<u32>) -> Result<(), u32> {
     match draft {
-        None => Err(pr.draw(uniform(p.seed, pos), None)),
+        None => Err(pr.pick(p, pos)),
         Some(d) => {
             if let Prepared::One(x) = pr {
                 return if x == d { Ok(()) } else { Err(x) };
+            }
+            if hash_rng_on() {
+                // 結び付け（spec::Verify::Match と同じ）: 本体の P から Gumbel-max で y。下書きと同じなら受け取り。
+                // y は (P, seed, pos) だけで決まる → 下書きのあり・なし・k によらず同じ語。分布は P のまま
+                let y = pr.gumbel_pick(p.seed, pos);
+                return if y == d { Ok(()) } else { Err(y) };
             }
             let pd = pr.prob(d);
             if pd > 0.0 && uniform(p.seed ^ ACCEPT_TAG, pos) < pd {
@@ -465,6 +500,13 @@ pub fn spec_row_prepared(pr: Prepared, p: &SamplingParams, pos: u64, draft: Opti
             }
         }
     }
+}
+
+/// 乱数を (seed, 位置, 語) のハッシュで決める（Gumbel-max・本体と下書きで同じ雑音）か（既定 切。TACHYON_HASH_RNG=1 で入）。
+/// 入にすると温度 > 0 の語の列は前の版と変わる（分布は同じ）。温度 0 は変わらない
+pub fn hash_rng_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TACHYON_HASH_RNG").map_or(false, |v| v == "1"))
 }
 
 /// GPU の候補で抜き取るか（既定 1。TACHYON_GPU_SAMPLE=0 で前の道＝logits 全部を手元へ）

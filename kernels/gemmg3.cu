@@ -10,6 +10,7 @@
 // 書き出しは f32・f16・f32 に足す（残差）・SwiGLU（silu(gate)·up を f16 で）。K は分けない（毎回同じ答え）。
 #include <atomic>
 #include <cstdint>
+#include <type_traits>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include "g3.cuh"
@@ -39,12 +40,16 @@ struct Args {
     const __half* x;
     const __half* xlo;  // XL の道だけ
     int nmat, mode, k, m, ldx, ntiles;
-    // MoE の専門家ごと（grp が null でなければ）: ブロックの行 y = 仕事 grp[3y..3y+2] = (専門家 e, 行の頭 m0, 行の数 mr)。
-    // W_i = mat[i].w + e·es[i]。X の行 r は xidx[r]（null なら r）。Y の行は r のまま（専門家の順に並んだ行）
+};
+// MoE の専門家ごと: ブロックの行 y = 仕事 grp[3y..3y+2] = (専門家 e, 行の頭 m0, 行の数 mr)。
+// W_i = mat[i].w + e·es[i]。X の行 r は xidx[r]（null なら r）。Y の行は r のまま（専門家の順に並んだ行）。
+// ⭐ 密な道（27B）は Args のまま・MoE の分岐なしで作る: 1 つの型に混ぜた 11-14 の版で、密なプレフィルの g3 GEMM が 5.6% 遅くなった（GPU1 の nsys・8K 語）
+struct ArgsM : Args {
     const int* grp;
     const int* xidx;
     int64_t es[MAXMAT];
 };
+template <class A> constexpr bool IS_M = std::is_same_v<A, ArgsM>;
 
 // タイルの組: ブロックの語 TOKB、語の向きの warp WT（行の向きは NW/WT）、warp の FM×16 語 × FN×16 行
 template <int TOKB_, int WT_, int FM_, int FN_>
@@ -98,8 +103,8 @@ __device__ __forceinline__ void deq_scaled(const typename W<T>::C& c, const type
 }
 
 // 本体（作る側の型 T が決まった後）。acc[i][j] = 語の区画 i × 行の区画 j の 16×16
-template <class C, int T, bool XL>
-__device__ __forceinline__ void mainloop(const Args& a, uint8_t* sm, int warp, int lane, const uint8_t* tp, bool tv, int m0, int mr,
+template <class C, int T, bool XL, class A>
+__device__ __forceinline__ void mainloop(const A& a, uint8_t* sm, int warp, int lane, const uint8_t* tp, bool tv, int m0, int mr,
                                          const int (&brow)[C::FN], float (&acc)[C::FM][C::FN][8]) {
     using WT = W<T>;
     using CW = typename WT::C;
@@ -118,7 +123,10 @@ __device__ __forceinline__ void mainloop(const Args& a, uint8_t* sm, int warp, i
     for (int v = 0; v < C::XV; ++v) {
         const int idx = tid + v * NTH, row = idx >> 2, c = idx & 3;
         xw[v] = idx < C::TOKB * 4;
-        const int xr_ = xw[v] && row < mr ? (a.xidx ? a.xidx[m0 + row] : m0 + row) : 0;
+        int xr_ = xw[v] && row < mr ? m0 + row : 0;
+        if constexpr (IS_M<A>) {
+            if (xw[v] && row < mr && a.xidx) xr_ = a.xidx[m0 + row];
+        }
         xs[v] = xw[v] && row < mr ? a.x + int64_t(xr_) * a.ldx + c * 8 : nullptr;
         xo[v] = soff(row, c);
     }
@@ -224,20 +232,22 @@ __device__ __forceinline__ void mainloop(const Args& a, uint8_t* sm, int warp, i
     }
 }
 
-template <class C, bool XL>
-__global__ void __launch_bounds__(NTH, 1) g3gemm_kernel(const __grid_constant__ Args a) {
+template <class C, bool XL, class A>
+__global__ void __launch_bounds__(NTH, 1) g3gemm_kernel(const __grid_constant__ A a) {
     extern __shared__ __align__(16) uint8_t sm[];
     constexpr int FM = C::FM, FN = C::FN;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const bool sw = a.mode == M_SWIGLU || a.mode == M_SWIGLU_HL;
-    const bool hl = a.mode == M_SWIGLU_HL;
+    const bool hl = IS_M<A> && a.mode == M_SWIGLU_HL;
+    const bool sw = a.mode == M_SWIGLU || hl;
     const int bx = blockIdx.x;
     int m0 = blockIdx.y * C::TOKB, mr = min(C::TOKB, a.m - m0), ge = 0;
-    if (a.grp) {
-        ge = a.grp[3 * blockIdx.y], m0 = a.grp[3 * blockIdx.y + 1], mr = a.grp[3 * blockIdx.y + 2];
-        if (mr <= 0) return;  // 余りの仕事（ブロックの全員が同じ所で抜ける）
+    if constexpr (IS_M<A>) {
+        if (a.grp) {
+            ge = a.grp[3 * blockIdx.y], m0 = a.grp[3 * blockIdx.y + 1], mr = a.grp[3 * blockIdx.y + 2];
+            if (mr <= 0) return;  // 余りの仕事（ブロックの全員が同じ所で抜ける）
+        }
     }
-    const int mend = m0 + mr;
+    const int mend = IS_M<A> ? m0 + mr : a.m;  // 密な道は前と同じ a.m（m0 + mr を持つとレジスタが溢れた）
 
     // 作る側: この warp が戻すタイル（行列 pm のタイル pt）
     int pm = 0, pt;
@@ -251,7 +261,11 @@ __global__ void __launch_bounds__(NTH, 1) g3gemm_kernel(const __grid_constant__ 
     }
     const int ptype = a.mat[pm].type;
     const bool tv = pt < a.mat[pm].tiles;
-    const uint8_t* tp = a.mat[pm].w + (a.grp ? int64_t(ge) * a.es[pm] : 0) + int64_t(tv ? pt : 0) * tile_bytes(ptype, a.k);
+    int64_t eoff = 0;
+    if constexpr (IS_M<A>) {
+        if (a.grp) eoff = int64_t(ge) * a.es[pm];
+    }
+    const uint8_t* tp = a.mat[pm].w + eoff + int64_t(tv ? pt : 0) * tile_bytes(ptype, a.k);
 
     // 掛ける側: 行の区画 j の段の行（SwiGLU は前半 j が gate、後半が up の同じ行）
     const int q = (lane >> 2) & 3, l4 = (lane & 3) + 4 * (lane >> 4);
@@ -279,7 +293,7 @@ __global__ void __launch_bounds__(NTH, 1) g3gemm_kernel(const __grid_constant__ 
 
     switch (ptype) {
 #define CASE(T) \
-    case T: mainloop<C, T, XL>(a, sm, warp, lane, tp, tv, m0, mr, brow, acc); break;
+    case T: mainloop<C, T, XL, A>(a, sm, warp, lane, tp, tv, m0, mr, brow, acc); break;
         CASE(Q_Q4_K) CASE(Q_Q5_K) CASE(Q_Q6_K) CASE(Q_Q8_0) CASE(Q_IQ4_NL) CASE(Q_IQ4_XS)
 #undef CASE
     }
@@ -355,9 +369,9 @@ int cur_dev() {
     return dev >= 0 && dev < MAXDEV ? dev : 0;
 }
 
-template <class C, bool XL>
-int launch(const Args& a, cudaStream_t s) {
-    auto f = g3gemm_kernel<C, XL>;
+template <class C, bool XL, class A>
+int launch(const A& a, cudaStream_t s) {
+    auto f = g3gemm_kernel<C, XL, A>;
     constexpr int SMEM = C::template smem<XL>();
     static_assert(SMEM <= 96 * 1024, "共有メモリは 96KB まで");
     static std::atomic<bool> attr[MAXDEV] = {};
@@ -369,20 +383,23 @@ int launch(const Args& a, cudaStream_t s) {
     const bool sw = a.mode == M_SWIGLU || a.mode == M_SWIGLU_HL;
     const int nbx = sw ? (a.mat[0].tiles + 3) / 4 : (a.ntiles + NW - 1) / NW;
     if (nbx == 0) return 0;
-    const int nby = a.grp ? a.m : (a.m + C::TOKB - 1) / C::TOKB;  // grp のときの a.m = 仕事の数
+    int nby = (a.m + C::TOKB - 1) / C::TOKB;
+    if constexpr (IS_M<A>) {
+        if (a.grp) nby = a.m;  // grp のときの a.m = 仕事の数
+    }  // grp のときの a.m = 仕事の数
     if (nby == 0) return 0;
     const dim3 grid(nbx, nby);
     f<<<grid, NTH, SMEM, s>>>(a);
     return int(cudaGetLastError());
 }
 
-template <bool XL>
-int run_cfg(int cfg, const Args& a, cudaStream_t s) {
+template <bool XL, class A>
+int run_cfg(int cfg, const A& a, cudaStream_t s) {
     switch (cfg) {
-        case 0: return launch<CA, XL>(a, s);
-        case 1: return launch<CB, XL>(a, s);
-        case 2: return launch<CC, XL>(a, s);
-        case 3: return launch<CD, XL>(a, s);
+        case 0: return launch<CA, XL, A>(a, s);
+        case 1: return launch<CB, XL, A>(a, s);
+        case 2: return launch<CC, XL, A>(a, s);
+        case 3: return launch<CD, XL, A>(a, s);
     }
     return -4;
 }
@@ -441,7 +458,7 @@ int infer_g3_moe_gemm(int nmat, const int* qtypes, const void* const* ws, const 
     if ((reinterpret_cast<uintptr_t>(x) & 15) || (ldx & 7)) return -5;
     if (n_blk <= 0) return 0;
     if (n_blk > 65535) return -3;
-    Args a{};
+    ArgsM a{};
     int nt = 0;
     for (int i = 0; i < nmat; ++i) {
         if (packed_type(qtypes[i]) != qtypes[i]) return -1;

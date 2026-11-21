@@ -341,6 +341,9 @@ pub struct DraftAsk {
     pub k: usize,
     /// None は argmax。Some((加工, seed, 結び付け)) は Q から取る（結び付け = 本体と同じ雑音 TAG_SAMPLE、でなければ TAG_DRAFT）
     pub sample: Option<(Sampling, u64, bool)>,
+    /// Some((seed, 温度)) なら、下書きの語を GPU の上で Gumbel-max（本体と同じ雑音 G(seed, 位置, TAG_SAMPLE, 語)）で選ぶ（TACHYON_HASH_RNG。
+    /// sample より軽い: 上位 1 つの道・chain・絞った lm_head のまま）。sample が Some ならそちらが勝つ
+    pub gumbel: Option<(u64, f32)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -348,6 +351,9 @@ pub struct DraftOut {
     pub tokens: Vec<u32>,
     /// 下書きの分布（Rs で要る。argmax の下書きなら None）
     pub q: Option<Vec<Dist>>,
+    /// HCAP の影の測り（TACHYON_HCAP_SHADOW）: 語ごとの 2・3 番手と、その段の Q の 1 位の確率（無ければ空）
+    pub alts: Vec<[u32; 2]>,
+    pub conf: Vec<f32>,
 }
 
 /// 下書き役（MTP・DSpine）
@@ -415,6 +421,7 @@ impl SpecSeq {
             pos: self.pos,
             k,
             sample: self.draft_sample.map(|c| (self.sampling, self.seed, c)),
+            gumbel: None,
         })
     }
     fn sampling_opt(&self) -> Option<Sampling> {
@@ -686,7 +693,7 @@ impl Drafter<ToyH> for ToyDrafter {
             // MTP と同じく、下書きの行も KV に書く（次の追いつきが上書きする）
             kv.push(a.id_last);
             kv.extend_from_slice(&toks[..a.k.saturating_sub(1)]);
-            res.push(DraftOut { tokens: toks, q: if a.sample.is_some() { Some(qs) } else { None } });
+            res.push(DraftOut { tokens: toks, q: if a.sample.is_some() { Some(qs) } else { None }, ..Default::default() });
         }
         Ok(res)
     }

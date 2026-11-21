@@ -46,7 +46,7 @@ mod dffi {
             dt_bias: *const f32, norm_w: *const f32, state: *mut f32, slots: *const i32, y: *mut f32, y_ld: i64, xp: *mut c_void, b: i32,
             hk: i32, hv: i32, eps: f32, s: Stream,
         ) -> i32;
-        pub fn infer_m_rope_tab(pos: *const i32, n: i32, n_rot: i32, sections: *const i32, theta: f32, tab: *mut c_void, s: Stream) -> i32;
+        pub fn infer_m_rope_tab(pos: *const i32, n: i32, n_rot: i32, sections: *const i32, theta: f32, yarn: *const f32, tab: *mut c_void, s: Stream) -> i32;
         pub fn infer_m_qk_rope(
             q: *const f32, k: *const f32, v: *const f32, q_ld: i64, k_ld: i64, v_ld: i64, q_norm: *const f32, k_norm: *const f32,
             tab: *const c_void, slot: *const i32, q_out: *mut c_void, kc: *mut c_void, vc: *mut c_void, n: i32, h: i32, hkv: i32,
@@ -232,6 +232,10 @@ struct StepIo {
     conv: *mut u8,
     kc: *mut u8,
     vc: *mut u8,
+    /// int8 の KV の係数（kv8 でなければ null）と層ごとの幅
+    ks: *mut u8,
+    vs: *mut u8,
+    ks_stride: usize,
     state_stride: usize,
     conv_stride: usize,
     kv_stride: usize,
@@ -308,6 +312,9 @@ impl Model {
             conv: pool.conv.ptr.cast(),
             kc: pool.kc.ptr.cast(),
             vc: pool.vc.ptr.cast(),
+            ks: if pool.kv8 { pool.ks.ptr.cast() } else { null_mut() },
+            vs: if pool.kv8 { pool.vs.ptr.cast() } else { null_mut() },
+            ks_stride: pool.total_pages * pool.scale_bytes,
             state_stride: pool.state_len * 4,
             conv_stride: pool.conv_len * 4,
             kv_stride: pool.total_pages * pool.page_bytes,
@@ -372,7 +379,7 @@ impl Model {
             "embed",
         );
         let sh = cfg.attn;
-        check(unsafe { dffi::infer_m_rope_tab(io.pos, b as i32, sh.n_rot as i32, sh.sections.as_ptr(), sh.theta, io.tab, s) }, "rope tab");
+        check(unsafe { dffi::infer_m_rope_tab(io.pos, b as i32, sh.n_rot as i32, sh.sections.as_ptr(), sh.theta, sh.yarn.as_arr().as_ptr(), io.tab, s) }, "rope tab");
         let norm_xp = |x: *const f32, w: &DevBuf, xp: &DevBuf| {
             check(
                 unsafe { dffi::infer_m_rmsnorm_xp(x, d as i64, w.f32p(), d as i32, b as i32, eps, null_mut(), 0, xp.ptr, s) },
@@ -389,8 +396,15 @@ impl Model {
             );
         };
         let (mut gi, mut ai) = (0usize, 0usize);
-        for l in &self.layers {
+        for (il, l) in self.layers.iter().enumerate() {
+            // mHC（SenseNova-Loop）: h = 枝の入口 → norm → h を 0 に（枝の出口が h に足される）→ 合流
+            if let Some(hw) = l.hc.as_ref() {
+                self.hc_route(sc, cfg.lp.unwrap().mhc_first(il), &hw.attn_w, &hw.attn_b, b, s);
+            }
             norm_xp(sc.h.f32p(), &l.attn_norm, &sc.xp_d);
+            if l.hc.is_some() {
+                self.hc_zero_h(sc, b, s);
+            }
             match &l.mix {
                 Mix::Gdn(w) => {
                     let g = cfg.gdn;
@@ -435,19 +449,47 @@ impl Model {
                     );
                     let kc: *mut c_void = unsafe { io.kc.add(ai * io.kv_stride).cast() };
                     let vc: *mut c_void = unsafe { io.vc.add(ai * io.kv_stride).cast() };
-                    check(
-                        unsafe {
-                            dffi::infer_m_qk_rope(sc.qf.f32p(), sc.kk.f32p(), sc.vv.f32p(), qw as i64, kv as i64, kv as i64, w.q_norm.f32p(),
-                                                  w.k_norm.f32p(), io.tab, io.kvs, sc.q16.ptr, kc, vc, b as i32, sh.h as i32, sh.hkv as i32,
-                                                  sh.n_rot as i32, sh.eps, s)
-                        },
-                        "qk rope",
-                    );
+                    let (ks, vs): (*mut f32, *mut f32) = if io.ks.is_null() {
+                        (null_mut(), null_mut())
+                    } else {
+                        unsafe { (io.ks.add(ai * io.ks_stride).cast(), io.vs.add(ai * io.ks_stride).cast()) }
+                    };
+                    if ks.is_null() {
+                        check(
+                            unsafe {
+                                dffi::infer_m_qk_rope(sc.qf.f32p(), sc.kk.f32p(), sc.vv.f32p(), qw as i64, kv as i64, kv as i64, w.q_norm.f32p(),
+                                                      w.k_norm.f32p(), io.tab, io.kvs, sc.q16.ptr, kc, vc, b as i32, sh.h as i32, sh.hkv as i32,
+                                                      sh.n_rot as i32, sh.eps, s)
+                            },
+                            "qk rope",
+                        );
+                    } else {
+                        // int8 の KV（--kv8）: 表を使わない rope（プレフィルと同じカーネル・同じ式）で int8 に詰めて書く
+                        let mut r = attn::RopeParams::new(&sh);
+                        r.q = sc.qf.f32p();
+                        r.k = sc.kk.f32p();
+                        r.v = sc.vv.f32p();
+                        r.q_norm = w.q_norm.f32p();
+                        r.k_norm = w.k_norm.f32p();
+                        r.pos = io.pos;
+                        r.slot = io.kvs;
+                        r.q_out = sc.q16.ptr;
+                        r.kc = kc;
+                        r.vc = vc;
+                        r.ks = ks;
+                        r.vs = vs;
+                        r.kv8 = 1;
+                        r.n = b as i32;
+                        attn::rope(&r, s).unwrap_or_else(|e| panic!("decode の rope（int8）: {e}"));
+                    }
                     let mut p = AttnParams::new(&sh);
                     p.q = sc.q16.ptr;
                     p.gate = unsafe { sc.qf.f32p().add(attn::D) };
                     p.kc = kc;
                     p.vc = vc;
+                    p.ks = ks;
+                    p.vs = vs;
+                    p.kv8 = !ks.is_null() as i32;
                     p.block_table = io.bt;
                     p.bt_ld = io.bt_ld as i32;
                     p.q_start = io.qs;
@@ -468,6 +510,10 @@ impl Model {
                     ai += 1;
                 }
             }
+            if let Some(hw) = l.hc.as_ref() {
+                self.hc_merge(sc, b, s);
+                self.hc_route(sc, false, &hw.ffn_w, &hw.ffn_b, b, s);
+            }
             if l.moe.is_some() {
                 // MoE（3.6）: ルーターは f32 の b を読むので xa にも書く
                 check(
@@ -481,6 +527,9 @@ impl Model {
                 continue;
             }
             norm_xp(sc.h.f32p(), &l.post_norm, &sc.xp_d);
+            if l.hc.is_some() {
+                self.hc_zero_h(sc, b, s);
+            }
             check(
                 unsafe {
                     ffi::infer_g3_swiglu(l.gate.qt, l.gate.buf.ptr, l.up.qt, l.up.buf.ptr, d as i32, ff as i32, sc.xp_d.ptr, null_mut(),
@@ -489,6 +538,9 @@ impl Model {
                 "g3 swiglu",
             );
             add(&l.down, &sc.xp_ff);
+            if l.hc.is_some() {
+                self.hc_merge(sc, b, s);
+            }
         }
         // 出口
         let out = self.output.as_ref().unwrap();
@@ -598,6 +650,9 @@ impl Model {
             conv: pool.conv.ptr.cast(),
             kc: pool.kc.ptr.cast(),
             vc: pool.vc.ptr.cast(),
+            ks: if pool.kv8 { pool.ks.ptr.cast() } else { null_mut() },
+            vs: if pool.kv8 { pool.vs.ptr.cast() } else { null_mut() },
+            ks_stride: pool.total_pages * pool.scale_bytes,
             state_stride: pool.state_len * 4,
             conv_stride: pool.conv_len * 4,
             kv_stride: pool.total_pages * pool.page_bytes,
@@ -658,7 +713,7 @@ impl Model {
         let eps = cfg.eps;
         check(unsafe { kffi::infer_m_embed(self.embd_qt as i32, self.embd.ptr, d as i32, io.ids, t as i32, sc.h.f32p(), s) }, "embed");
         let sh = cfg.attn;
-        check(unsafe { dffi::infer_m_rope_tab(io.pos, t as i32, sh.n_rot as i32, sh.sections.as_ptr(), sh.theta, io.tab, s) }, "rope tab");
+        check(unsafe { dffi::infer_m_rope_tab(io.pos, t as i32, sh.n_rot as i32, sh.sections.as_ptr(), sh.theta, sh.yarn.as_arr().as_ptr(), io.tab, s) }, "rope tab");
         let norm_xp = |x: *const f32, w: &DevBuf, y: *mut f32, xp: &DevBuf| {
             check(
                 unsafe { dffi::infer_m_rmsnorm_xp(x, d as i64, w.f32p(), d as i32, t as i32, eps, y, d as i64, xp.ptr, s) },
@@ -674,8 +729,14 @@ impl Model {
             );
         };
         let (mut gi, mut ai) = (0usize, 0usize);
-        for l in &self.layers {
+        for (il, l) in self.layers.iter().enumerate() {
+            if let Some(hw) = l.hc.as_ref() {
+                self.hc_route(sc, cfg.lp.unwrap().mhc_first(il), &hw.attn_w, &hw.attn_b, t, s);
+            }
             norm_xp(sc.h.f32p(), &l.attn_norm, null_mut(), &sc.xp_d);
+            if l.hc.is_some() {
+                self.hc_zero_h(sc, t, s);
+            }
             match &l.mix {
                 Mix::Gdn(w) => {
                     let g = cfg.gdn;
@@ -730,19 +791,47 @@ impl Model {
                     );
                     let kc: *mut c_void = unsafe { io.kc.add(ai * io.kv_stride).cast() };
                     let vc: *mut c_void = unsafe { io.vc.add(ai * io.kv_stride).cast() };
-                    check(
-                        unsafe {
-                            dffi::infer_m_qk_rope(sc.qf.f32p(), sc.kk.f32p(), sc.vv.f32p(), qw as i64, kv as i64, kv as i64, w.q_norm.f32p(),
-                                                  w.k_norm.f32p(), io.tab, io.kvs, sc.q16.ptr, kc, vc, t as i32, sh.h as i32, sh.hkv as i32,
-                                                  sh.n_rot as i32, sh.eps, s)
-                        },
-                        "qk rope",
-                    );
+                    let (ks, vs): (*mut f32, *mut f32) = if io.ks.is_null() {
+                        (null_mut(), null_mut())
+                    } else {
+                        unsafe { (io.ks.add(ai * io.ks_stride).cast(), io.vs.add(ai * io.ks_stride).cast()) }
+                    };
+                    if ks.is_null() {
+                        check(
+                            unsafe {
+                                dffi::infer_m_qk_rope(sc.qf.f32p(), sc.kk.f32p(), sc.vv.f32p(), qw as i64, kv as i64, kv as i64, w.q_norm.f32p(),
+                                                      w.k_norm.f32p(), io.tab, io.kvs, sc.q16.ptr, kc, vc, t as i32, sh.h as i32, sh.hkv as i32,
+                                                      sh.n_rot as i32, sh.eps, s)
+                            },
+                            "qk rope",
+                        );
+                    } else {
+                        // int8 の KV（--kv8）: 表を使わない rope（プレフィルと同じカーネル・同じ式）で int8 に詰めて書く
+                        let mut r = attn::RopeParams::new(&sh);
+                        r.q = sc.qf.f32p();
+                        r.k = sc.kk.f32p();
+                        r.v = sc.vv.f32p();
+                        r.q_norm = w.q_norm.f32p();
+                        r.k_norm = w.k_norm.f32p();
+                        r.pos = io.pos;
+                        r.slot = io.kvs;
+                        r.q_out = sc.q16.ptr;
+                        r.kc = kc;
+                        r.vc = vc;
+                        r.ks = ks;
+                        r.vs = vs;
+                        r.kv8 = 1;
+                        r.n = t as i32;
+                        attn::rope(&r, s).unwrap_or_else(|e| panic!("verify の rope（int8）: {e}"));
+                    }
                     let mut p = AttnParams::new(&sh);
                     p.q = sc.q16.ptr;
                     p.gate = unsafe { sc.qf.f32p().add(attn::D) };
                     p.kc = kc;
                     p.vc = vc;
+                    p.ks = ks;
+                    p.vs = vs;
+                    p.kv8 = !ks.is_null() as i32;
                     p.block_table = io.bt;
                     p.bt_ld = io.bt_ld as i32;
                     p.q_start = io.qs;
@@ -763,12 +852,19 @@ impl Model {
                     ai += 1;
                 }
             }
+            if let Some(hw) = l.hc.as_ref() {
+                self.hc_merge(sc, t, s);
+                self.hc_route(sc, false, &hw.ffn_w, &hw.ffn_b, t, s);
+            }
             if l.moe.is_some() {
                 norm_xp(sc.h.f32p(), &l.post_norm, sc.xa.f32p(), &sc.xp_d);
                 self.moe_ffn(l, sc, t, false, s);
                 continue;
             }
             norm_xp(sc.h.f32p(), &l.post_norm, null_mut(), &sc.xp_d);
+            if l.hc.is_some() {
+                self.hc_zero_h(sc, t, s);
+            }
             check(
                 unsafe {
                     ffi::infer_g3_swiglu(l.gate.qt, l.gate.buf.ptr, l.up.qt, l.up.buf.ptr, d as i32, ff as i32, sc.xp_d.ptr, null_mut(),
@@ -777,6 +873,9 @@ impl Model {
                 "g3 swiglu",
             );
             add(&l.down, &sc.xp_ff);
+            if l.hc.is_some() {
+                self.hc_merge(sc, t, s);
+            }
         }
         // 出口: h_nextn（output_norm の後）を hout へ（MTP が読む）、logits [T][vocab]、行ごとの 1 位
         let out = self.output.as_ref().unwrap();

@@ -43,6 +43,15 @@ mod kffi {
         pub fn infer_m_nonfinite(x: *const f32, n: i64, cnt: *mut i32, s: Stream) -> i32;
         pub fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
         pub fn cudaMemset(p: *mut c_void, v: i32, n: usize) -> i32;
+        pub fn cudaMemsetAsync(p: *mut c_void, v: i32, n: usize, s: Stream) -> i32;
+        // mHC（kernels/mhc.cu・SenseNova-Loop）
+        pub fn infer_mhc_route(
+            a: *const f32, b: *const f32, ld: i64, d: i32, w: *const f32, bias: *const f32, t: i32, iters: i32, pre_scale: f32, h: *mut f32,
+            h_ld: i64, rt: *mut f32, s: Stream,
+        ) -> i32;
+        pub fn infer_mhc_merge(
+            a: *mut f32, b: *mut f32, ld: i64, d: i32, y: *const f32, y_ld: i64, rt: *const f32, t: i32, h: *mut f32, h_ld: i64, s: Stream,
+        ) -> i32;
         pub fn cudaStreamCreateWithPriority(s: *mut Stream, flags: u32, prio: i32) -> i32;
         pub fn cudaStreamSynchronize(s: Stream) -> i32;
         pub fn cudaStreamQuery(s: Stream) -> i32;
@@ -102,6 +111,105 @@ pub struct Config {
     pub gdn: gdn::Shape,
     /// MoE（Qwen3.6-35B-A3B・arch qwen35moe）。None なら密な FFN（Qwen3.8-27B・arch qwen35）
     pub moe: Option<MoeCfg>,
+    /// 層の繰り返しと mHC（SenseNova-Loop・arch sensenova_loop）。None なら層は 1 回ずつ。
+    /// Some のとき n_layer は「実行の数」（56）で、層 il の重みは物理の層 phys(il) のもの。KV・GDN の状態は実行ごとに別
+    pub lp: Option<LoopCfg>,
+}
+
+/// SenseNova-Loop の形（GGUF の sensenova_loop.loop.*・mhc.*）。実行の順 = 0..start、start..end を count 回、end..n_phys。
+/// 学習していないモデル（qwen35・qwen35moe）の層の繰り返し（`--repeat-layers S:E:N`・枝 relayer）にも使う: mHC なし（mhc_start = mhc_end = 0）・
+/// 普通の残差・重みはどの実行も物理の blk から
+#[derive(Clone, Copy, Debug)]
+pub struct LoopCfg {
+    pub start: usize,
+    pub end: usize,
+    pub count: usize,
+    /// 物理の層の数（32）
+    pub n_phys: usize,
+    /// mHC の物理の層の範囲（4..28）。残差は 2 本、最初の層で h を 2 本に写し、最後の層の出口で平均に戻す
+    pub mhc_start: usize,
+    pub mhc_end: usize,
+    /// Sinkhorn の回数（20）
+    pub iters: usize,
+    pub pre_scale: f32,
+    /// SenseNova-Loop の GGUF は繰り返しの後ろの層を実行の番号の blk（52..55）に置く。層の繰り返し（relayer）は false（物理の blk）
+    pub tail_blk_exec: bool,
+}
+
+/// 層の繰り返し（`--repeat-layers START:END:N`・環境変数 TACHYON_REPEAT_LAYERS）: 物理の層 START..END を合わせて N 回。重みを読む前に決める。
+/// 2 回目以降は無視（最初の物が残る）。N = 1 は切と同じ
+static REPEAT: std::sync::OnceLock<Option<(usize, usize, usize)>> = std::sync::OnceLock::new();
+
+fn parse_repeat(v: &str) -> Result<Option<(usize, usize, usize)>, String> {
+    let v = v.trim();
+    if v.is_empty() || v == "none" || v == "0" {
+        return Ok(None);
+    }
+    let p: Vec<&str> = v.split(':').collect();
+    let n = |x: &str| x.trim().parse::<usize>().map_err(|_| format!("--repeat-layers は START:END:N（{v}）"));
+    if p.len() != 3 {
+        return Err(format!("--repeat-layers は START:END:N（{v}）"));
+    }
+    let (a, b, c) = (n(p[0])?, n(p[1])?, n(p[2])?);
+    if a >= b || c == 0 {
+        return Err(format!("--repeat-layers の範囲・回数が変（{v}）"));
+    }
+    Ok(if c == 1 { None } else { Some((a, b, c)) })
+}
+
+/// 引数の値（無ければ環境変数 TACHYON_REPEAT_LAYERS）で層の繰り返しを決める。返りは決まった値
+pub fn set_repeat_layers(arg: Option<&str>) -> Result<Option<(usize, usize, usize)>, String> {
+    let v = match arg {
+        Some(a) => parse_repeat(a)?,
+        None => match std::env::var("TACHYON_REPEAT_LAYERS") {
+            Ok(e) => parse_repeat(&e)?,
+            Err(_) => None,
+        },
+    };
+    if REPEAT.set(v).is_err() && repeat_layers() != v {
+        return Err(format!("層の繰り返しは 1 回だけ決める（前 {:?}・今 {v:?}）", repeat_layers()));
+    }
+    Ok(repeat_layers())
+}
+
+pub fn repeat_layers() -> Option<(usize, usize, usize)> {
+    REPEAT.get().copied().flatten()
+}
+
+impl LoopCfg {
+    fn extra(&self) -> usize {
+        (self.count - 1) * (self.end - self.start)
+    }
+    /// 実行 il の物理の層
+    pub fn phys(&self, il: usize) -> usize {
+        let w = self.end - self.start;
+        if il < self.start {
+            il
+        } else if il < self.end + self.extra() {
+            self.start + (il - self.start) % w
+        } else {
+            il - self.extra()
+        }
+    }
+    /// 実行 il の重みが GGUF のどの blk にあるか（繰り返しは最初の回の blk。最後の層は blk 52.. に実行の番号で置かれている）
+    pub fn src_blk(&self, il: usize) -> usize {
+        if !self.tail_blk_exec {
+            return self.phys(il);
+        }
+        if il >= self.start && il < self.end + self.extra() {
+            self.phys(il)
+        } else {
+            il
+        }
+    }
+    pub fn is_mhc(&self, il: usize) -> bool {
+        let p = self.phys(il);
+        p >= self.mhc_start && p < self.mhc_end
+    }
+    /// mHC の最初の層（h を 2 本に写す）
+    pub fn mhc_first(&self, il: usize) -> bool {
+        self.phys(il) == self.mhc_start
+    }
 }
 
 /// MoE の形（GGUF の qwen35moe.*）。FFN = 上位 k 個の専門家（softmax・重みを正規化）＋ 共有の専門家（sigmoid のゲート）
@@ -118,9 +226,9 @@ pub struct MoeCfg {
 impl Config {
     pub fn from_gguf(m: &gguf::Model) -> Result<Config, String> {
         let is_moe = match m.arch() {
-            "qwen35" => false,
+            "qwen35" | "sensenova_loop" => false,
             "qwen35moe" => true,
-            a => return Err(format!("arch が qwen35・qwen35moe ではない: {a}")),
+            a => return Err(format!("arch が qwen35・qwen35moe・sensenova_loop ではない: {a}")),
         };
         let u = |k: &str| m.hp_u32(k).map(|v| v as usize).ok_or_else(|| format!("{}.{k} が無い", m.arch()));
         let n_all = u("block_count")?;
@@ -136,7 +244,9 @@ impl Config {
         } else {
             None
         };
-        let cfg = Config {
+        let lp = if m.arch() == "sensenova_loop" { Some(Self::loop_cfg(m, n_all - nextn)?) } else { None };
+        let mut cfg = Config {
+            lp,
             n_layer: n_all - nextn,
             d: u("embedding_length")?,
             // MoE は共有の専門家の幅（密な FFN の作業場をそのまま共有の専門家に使う）
@@ -152,6 +262,7 @@ impl Config {
                 sections,
                 theta: m.hp_f32("rope.freq_base").ok_or("rope.freq_base が無い")?,
                 eps,
+                yarn: attn::yarn_for(u("rope.dimension_count")?, m.hp_f32("rope.freq_base").unwrap_or(1e7), attn::gguf_rope_scaling(m)),
             },
             gdn: gdn::Shape { hk: u("ssm.group_count")?, hv: u("ssm.time_step_rank")?, eps },
         };
@@ -170,7 +281,58 @@ impl Config {
                 return Err(format!("MoE の形がカーネルと合わない: {mc:?}"));
             }
         }
+        if let Some((start, end, count)) = repeat_layers() {
+            // 層の繰り返し（学習していない繰り返し・mHC なし）。境は Attention の組（interval 層）に揃える＝実行の番号 il % interval が物理の層と同じ種類
+            if cfg.lp.is_some() {
+                return Err("--repeat-layers は sensenova_loop と一緒に使えない".into());
+            }
+            let iv = cfg.interval;
+            if start % iv != 0 || end % iv != 0 || end > cfg.n_layer {
+                return Err(format!("--repeat-layers {start}:{end}:{count} は {iv} の倍数で 0..{} の中", cfg.n_layer));
+            }
+            let n_phys = cfg.n_layer;
+            let lp = LoopCfg { start, end, count, n_phys, mhc_start: 0, mhc_end: 0, iters: 0, pre_scale: 1.0, tail_blk_exec: false };
+            cfg.n_layer = n_phys + lp.extra();
+            for il in 0..cfg.n_layer {
+                assert_eq!(cfg.is_attn(il), cfg.is_attn(lp.phys(il)), "実行 {il} の層の種類");
+            }
+            cfg.lp = Some(lp);
+        }
+        if m.arch() == "sensenova_loop" {
+            // 実行ごとの層の種類（GGUF の attention.recurrent_layers）が il % 4 の決まりと合うか
+            let rec = m.hp("attention.recurrent_layers").and_then(|v| v.as_arr()).ok_or("attention.recurrent_layers が無い")?;
+            for il in 0..cfg.n_layer {
+                let r = rec.get(il).and_then(|v| v.as_bool()).ok_or("attention.recurrent_layers が短い")?;
+                if r == cfg.is_attn(il) {
+                    return Err(format!("実行 {il} の層の種類が full_attention_interval と合わない"));
+                }
+            }
+        }
         Ok(cfg)
+    }
+    /// sensenova_loop.loop.*・mhc.*（llama.cpp の OpenSenseNova 版と同じ決まりで確かめる）
+    fn loop_cfg(m: &gguf::Model, n_exec: usize) -> Result<LoopCfg, String> {
+        let u = |k: &str| m.hp_u32(k).map(|v| v as usize).ok_or_else(|| format!("sensenova_loop.{k} が無い"));
+        let (start, end, count) = (u("loop.start")?, u("loop.end")?, u("loop.count")?);
+        if count == 0 || start >= end {
+            return Err("loop の範囲・回数が変".into());
+        }
+        let extra = (count - 1) * (end - start);
+        if n_exec < end + extra {
+            return Err("loop の実行の数が block_count を超える".into());
+        }
+        let n_phys = n_exec - extra;
+        let (ms, me, streams, iters) = (u("mhc.start")?, u("mhc.end")?, u("mhc.streams")?, u("mhc.iterations")?);
+        let fixed = m.hp("mhc.fixed_identity").and_then(|v| v.as_bool()).ok_or("mhc.fixed_identity が無い")?;
+        let pre_scale = m.hp_f32("mhc.pre_scale").ok_or("mhc.pre_scale が無い")?;
+        if streams != 2 || fixed || iters == 0 || ms >= me || me > n_phys || !pre_scale.is_finite() || pre_scale <= 0.0 {
+            return Err(format!("mHC の形が対応外（streams {streams}・fixed_identity {fixed}・iterations {iters}・{ms}..{me}）"));
+        }
+        // mHC は loop の境をまたがない（中にあるなら繰り返しの度に入って出る）
+        if !(me <= start || (ms >= start && me <= end) || ms >= end) {
+            return Err("mHC の範囲が loop の境をまたぐ".into());
+        }
+        Ok(LoopCfg { start, end, count, n_phys, mhc_start: ms, mhc_end: me, iters, pre_scale, tail_blk_exec: true })
     }
     pub fn is_attn(&self, il: usize) -> bool {
         il % self.interval == self.interval - 1
@@ -234,6 +396,16 @@ pub struct LayerW {
     pub up: Mat,
     pub down: Mat,
     pub moe: Option<MoeW>,
+    /// mHC の層（SenseNova-Loop の 4..28）: Attention の前・FFN の前の振り分け
+    pub hc: Option<HcW>,
+}
+
+/// mHC の振り分けの重み（f32 [8][2d] と [8]。量子化しない）
+pub struct HcW {
+    pub attn_w: DevBuf,
+    pub attn_b: DevBuf,
+    pub ffn_w: DevBuf,
+    pub ffn_b: DevBuf,
 }
 
 /// MoE の層の重み: ルーター（f32 [n_exp + 1][d]。最後の行が共有の専門家のゲート）と、専門家を続けて並べた g3 の行列
@@ -313,8 +485,13 @@ struct Loader {
 
 impl Loader {
     fn mat(&mut self, tv: gguf::TensorView) -> Mat {
+        self.mat_rows(tv, 0, tv.n_rows())
+    }
+    /// 行 r0..r0+n だけを 1 本の行列に（qkv と gate を 1 本に繋いだ attn_qkv_gate などを分ける）
+    fn mat_rows(&mut self, tv: gguf::TensorView, r0_all: usize, n: usize) -> Mat {
         let src = tv.qt();
-        let (qt, k, n) = (src as i32, tv.k(), tv.n_rows());
+        let (qt, k) = (src as i32, tv.k());
+        assert!(r0_all + n <= tv.n_rows(), "{}: 行 {r0_all}+{n} が外", tv.name);
         let bytes = unsafe { ffi::infer_g3_bytes(qt, k as i32, n as i32) };
         assert!(bytes > 0, "{}: g3 が扱わない型 {}（k {k}）", tv.name, tv.type_name());
         let buf = DevBuf::new(bytes as usize);
@@ -325,12 +502,12 @@ impl Loader {
         let mut r0 = 0;
         while r0 < n {
             let nr = step.min(n - r0);
-            h2d(self.stage.ptr, tv.rows(r0, nr));
+            h2d(self.stage.ptr, tv.rows(r0_all + r0, nr));
             let dst: *mut c_void = at(&buf, r0 / 32 * tile);
             check(unsafe { ffi::infer_g3_repack(qt, self.stage.ptr, dst, k as i32, nr as i32, S) }, "g3 repack");
             r0 += nr;
         }
-        self.bytes_gguf += tv.bytes.len();
+        self.bytes_gguf += n * rb;
         self.bytes_gpu += buf.len;
         Mat { buf, qt: unsafe { ffi::infer_g3_type(qt) }, src, k, n }
     }
@@ -356,6 +533,11 @@ struct Pool {
     state_len: usize,
     conv_len: usize,
     page_bytes: usize,
+    /// KV が int8 か（attn::kv8()）。int8 なら ks・vs [Attention の層][頁][4][64][8] f32 の係数を持つ
+    kv8: bool,
+    scale_bytes: usize,
+    ks: DevBuf,
+    vs: DevBuf,
     /// GDN の状態を 2 倍取った（下書きの確かめの仮の置き場つき）
     spec_state: bool,
     state: DevBuf,
@@ -430,7 +612,9 @@ impl Seq {
         let n_gdn = layers.clone().filter(|&il| !cfg.is_attn(il)).count();
         let n_attn = layers.len() - n_gdn;
         let n_pages = (max_ctx + attn::PAGE - 1) / attn::PAGE;
-        let page_bytes = cfg.attn.page_bytes(false);
+        let kv8 = attn::kv8();
+        let page_bytes = cfg.attn.page_bytes(kv8);
+        let scale_bytes = if kv8 { cfg.attn.page_scales() * 4 } else { 0 };
         let total_pages = match total {
             Some(t) => (t + attn::PAGE - 1) / attn::PAGE,
             None => n * n_pages,
@@ -445,6 +629,10 @@ impl Seq {
             state_len,
             conv_len,
             page_bytes,
+            kv8,
+            scale_bytes,
+            ks: DevBuf::new(total_pages * n_attn.max(1) * scale_bytes),
+            vs: DevBuf::new(total_pages * n_attn.max(1) * scale_bytes),
             state: DevBuf::new(ns * n_gdn.max(1) * state_len * 4),
             conv: DevBuf::new(ns * n_gdn.max(1) * conv_len * 4),
             spec_state,
@@ -486,6 +674,18 @@ impl Seq {
     fn vc_at(&self, ai: usize) -> *mut c_void {
         let p = &self.pool;
         at(&p.vc, ai * p.total_pages * p.page_bytes)
+    }
+    /// int8 の KV の係数の頭（fp16 なら null）
+    fn ks_at(&self, ai: usize) -> *mut f32 {
+        let p = &self.pool;
+        if p.kv8 { at(&p.ks, ai * p.total_pages * p.scale_bytes) } else { std::ptr::null_mut() }
+    }
+    fn vs_at(&self, ai: usize) -> *mut f32 {
+        let p = &self.pool;
+        if p.kv8 { at(&p.vs, ai * p.total_pages * p.scale_bytes) } else { std::ptr::null_mut() }
+    }
+    pub fn kv8(&self) -> bool {
+        self.pool.kv8
     }
     /// 位置 p の KV の行の通し番号（頁 × 64 ＋ 頁の中の行）
     fn kv_row(&self, p: usize) -> i32 {
@@ -585,6 +785,11 @@ impl Seq {
             let off = (ai * p.total_pages + page as usize) * p.page_bytes;
             v.push((at::<u8>(&p.kc, off), p.page_bytes));
             v.push((at::<u8>(&p.vc, off), p.page_bytes));
+            if p.kv8 {
+                let so = (ai * p.total_pages + page as usize) * p.scale_bytes;
+                v.push((at::<u8>(&p.ks, so), p.scale_bytes));
+                v.push((at::<u8>(&p.vs, so), p.scale_bytes));
+            }
         }
         v
     }
@@ -628,7 +833,7 @@ impl Seq {
     /// この列の分の置き場（バイト）
     pub fn bytes(&self) -> usize {
         let p = &self.pool;
-        (p.state.len + p.conv.len + p.kc.len + p.vc.len) / p.n_slots
+        (p.state.len + p.conv.len + p.kc.len + p.vc.len + if p.kv8 { p.ks.len + p.vs.len } else { 0 }) / p.n_slots
     }
 }
 
@@ -716,6 +921,10 @@ struct Scratch {
     bt_pages: usize,
     /// MoE の層の作業場（3.6）
     moe: Option<MoeSc>,
+    /// mHC の 2 本の残差（f32 [tc][d] ずつ）と振り分け（f32 [tc][8]: post0, post1, m00, m01, m10, m11）。SenseNova-Loop だけ
+    hc_a: DevBuf,
+    hc_b: DevBuf,
+    hc_rt: DevBuf,
 }
 
 fn moe_gemm_on() -> bool {
@@ -852,13 +1061,16 @@ impl Scratch {
             cnt: DevBuf::new(4),
             bt_pages: 0,
             moe: cfg.moe.as_ref().map(|mc| MoeSc::new(cfg, mc, tc)),
+            hc_a: DevBuf::new(if cfg.lp.is_some() { tc * d * 4 } else { 16 }),
+            hc_b: DevBuf::new(if cfg.lp.is_some() { tc * d * 4 } else { 16 }),
+            hc_rt: DevBuf::new(if cfg.lp.is_some() { tc * 8 * 4 } else { 16 }),
         }
     }
     fn bytes(&self) -> usize {
         [
             &self.h, &self.xa, &self.x16, &self.mid16, &self.o16, &self.xp_d, &self.xp_o, &self.xp_ff, &self.qkv, &self.z,
             &self.alpha, &self.beta, &self.c, &self.y, &self.qf, &self.kk, &self.vv, &self.q16, &self.wdeq, &self.gemm_ws,
-            &self.gdn_ws, &self.attn_ws, &self.logits,
+            &self.gdn_ws, &self.attn_ws, &self.logits, &self.hc_a, &self.hc_b, &self.hc_rt,
         ]
         .iter()
         .map(|b| b.len)
@@ -900,7 +1112,8 @@ pub struct Model {
     pub opt: Opt,
     /// 載せた最初の層（ふつう 0）。layers[i] は層 layer0 + i
     pub layer0: usize,
-    pub layers: Vec<LayerW>,
+    /// 実行の順の層（SenseNova-Loop の繰り返しは同じ重みを Rc で指す）
+    pub layers: Vec<std::rc::Rc<LayerW>>,
     embd: DevBuf,
     embd_qt: QType,
     out_norm: DevBuf,
@@ -969,9 +1182,16 @@ impl Model {
             ld.bytes_gguf += et.bytes.len();
             ld.bytes_gpu += embd.len;
         }
-        let mut layers = Vec::with_capacity(range.len());
+        let mut layers: Vec<std::rc::Rc<LayerW>> = Vec::with_capacity(range.len());
+        // SenseNova-Loop: 繰り返しの実行は最初の回の重みを指す（GGUF の blk も最初の回の番号にしか無い）
+        let mut by_blk: HashMap<usize, std::rc::Rc<LayerW>> = HashMap::new();
         for il in range.clone() {
-            let l = g.layer(il);
+            let blk = cfg.lp.map_or(il, |lp| lp.src_blk(il));
+            if let Some(w) = by_blk.get(&blk) {
+                layers.push(w.clone());
+                continue;
+            }
+            let l = g.layer(blk);
             let mix = if cfg.is_attn(il) {
                 Mix::Attn(AttnW {
                     q: ld.mat(l.tensor("attn_q.weight")),
@@ -982,11 +1202,28 @@ impl Model {
                     k_norm: ld.f32v(l.tensor("attn_k_norm.weight")),
                 })
             } else {
+                // SenseNova-Loop の GGUF は qkv と gate（z）、β と α を 1 本に繋いである（llama.cpp の attn_qkv_gate・ssm_beta_alpha。前が qkv・β）
+                let (qkv, gate) = match l.get("attn_qkv_gate.weight") {
+                    Some(t) => {
+                        let (cc, ao) = (cfg.gdn.conv_ch(), cfg.gdn.out_dim());
+                        assert_eq!(t.n_rows(), cc + ao, "attn_qkv_gate の行の数");
+                        (ld.mat_rows(t, 0, cc), ld.mat_rows(t, cc, ao))
+                    }
+                    None => (ld.mat(l.tensor("attn_qkv.weight")), ld.mat(l.tensor("attn_gate.weight"))),
+                };
+                let (alpha, beta) = match l.get("ssm_beta_alpha.weight") {
+                    Some(t) => {
+                        let hv = cfg.gdn.hv;
+                        assert_eq!(t.n_rows(), 2 * hv, "ssm_beta_alpha の行の数");
+                        (ld.mat_rows(t, hv, hv), ld.mat_rows(t, 0, hv))
+                    }
+                    None => (ld.mat(l.tensor("ssm_alpha.weight")), ld.mat(l.tensor("ssm_beta.weight"))),
+                };
                 Mix::Gdn(GdnW {
-                    qkv: ld.mat(l.tensor("attn_qkv.weight")),
-                    gate: ld.mat(l.tensor("attn_gate.weight")),
-                    alpha: ld.mat(l.tensor("ssm_alpha.weight")),
-                    beta: ld.mat(l.tensor("ssm_beta.weight")),
+                    qkv,
+                    gate,
+                    alpha,
+                    beta,
                     out: ld.mat(l.tensor("ssm_out.weight")),
                     a: ld.f32v(l.tensor("ssm_a")),
                     dt: ld.f32v(l.tensor("ssm_dt.bias")),
@@ -1023,7 +1260,24 @@ impl Model {
                      Some(moe))
                 }
             };
-            layers.push(LayerW {
+            let hc = match cfg.lp {
+                Some(lp) if lp.is_mhc(il) => {
+                    let mut hv = |n: &str, len: usize| {
+                        let t = l.tensor(n);
+                        assert_eq!(t.n_elems(), len, "{n} の大きさ");
+                        ld.f32v(t)
+                    };
+                    let d2 = 2 * cfg.d;
+                    Some(HcW {
+                        attn_w: hv("hc_attn_fn.weight", 8 * d2),
+                        attn_b: hv("hc_attn_fn.bias", 8),
+                        ffn_w: hv("hc_ffn_fn.weight", 8 * d2),
+                        ffn_b: hv("hc_ffn_fn.bias", 8),
+                    })
+                }
+                _ => None,
+            };
+            let w = std::rc::Rc::new(LayerW {
                 attn_norm: ld.f32v(l.tensor("attn_norm.weight")),
                 post_norm: ld.f32v(l.tensor("post_attention_norm.weight")),
                 mix,
@@ -1031,7 +1285,14 @@ impl Model {
                 up,
                 down,
                 moe,
+                hc,
             });
+            by_blk.insert(blk, w.clone());
+            layers.push(w);
+        }
+        if let Some(lp) = cfg.lp {
+            // 途中から載せるとき、mHC の 2 本の残差は入口の h からは作れない（mHC の最初の層か、その外から始める）
+            assert!(range.start == 0 || !lp.is_mhc(range.start) || lp.mhc_first(range.start), "mHC の途中の層 {} からは載せられない", range.start);
         }
         let out_norm = ld.f32v(g.tensor("output_norm.weight"));
         let output = if full { Some(ld.mat(g.tensor("output.weight"))) } else { None };
@@ -1515,6 +1776,9 @@ impl Model {
         r.q_out = sc.q16.ptr;
         r.kc = seq.kc_at(ai);
         r.vc = seq.vc_at(ai);
+        r.ks = seq.ks_at(ai);
+        r.vs = seq.vs_at(ai);
+        r.kv8 = seq.kv8() as i32;
         r.n = t as i32;
         attn::rope(&r, self.st).unwrap_or_else(|e| panic!("層 {il}: {e}"));
         let mut p = AttnParams::new(&cfg.attn);
@@ -1522,6 +1786,9 @@ impl Model {
         p.gate = unsafe { sc.qf.f32p().add(attn::D) };
         p.kc = seq.kc_at(ai);
         p.vc = seq.vc_at(ai);
+        p.ks = seq.ks_at(ai);
+        p.vs = seq.vs_at(ai);
+        p.kv8 = seq.kv8() as i32;
         p.block_table = sc.bt.ptr.cast();
         p.bt_ld = seq.n_pages as i32;
         p.q_start = sc.qs.ptr.cast();
@@ -1552,6 +1819,41 @@ impl Model {
             }
         }
         self.mm_add(&w.o, t, path, sc.y.f32p(), &sc.xp_o, sc.o16.ptr);
+    }
+
+    /// mHC の層の頭（SenseNova-Loop）: 最初の mHC の層なら 2 本の残差 a = b = h。振り分け（W・bias）で h = 枝の入口、sc.hc_rt に post・mix
+    pub(crate) fn hc_route(&self, sc: &Scratch, first: bool, w: &DevBuf, bias: &DevBuf, t: usize, s: ffi::Stream) {
+        let d = self.cfg.d;
+        let lp = self.cfg.lp.expect("mHC は SenseNova-Loop だけ");
+        if first {
+            for dst in [&sc.hc_a, &sc.hc_b] {
+                check(unsafe { kffi::cudaMemcpyAsync(dst.ptr, sc.h.ptr, t * d * 4, 3, s) }, "mHC の 2 本に写す");
+            }
+        }
+        check(
+            unsafe {
+                kffi::infer_mhc_route(sc.hc_a.f32p(), sc.hc_b.f32p(), d as i64, d as i32, w.f32p(), bias.f32p(), t as i32, lp.iters as i32,
+                                      lp.pre_scale, sc.h.f32p(), d as i64, sc.hc_rt.f32p(), s)
+            },
+            "mHC route",
+        );
+    }
+
+    /// 枝の計算（norm の後）の前に h を 0 に（枝の出口の行列は h に足し込むので、h = 枝の出口だけになる）
+    pub(crate) fn hc_zero_h(&self, sc: &Scratch, t: usize, s: ffi::Stream) {
+        check(unsafe { kffi::cudaMemsetAsync(sc.h.ptr, 0, t * self.cfg.d * 4, s) }, "mHC h を 0 に");
+    }
+
+    /// 枝の出口（h）を 2 本に合流。h = (a + b)/2（最後の mHC の層の出口・次の層が mHC でなければこれが残差）
+    pub(crate) fn hc_merge(&self, sc: &Scratch, t: usize, s: ffi::Stream) {
+        let d = self.cfg.d;
+        check(
+            unsafe {
+                kffi::infer_mhc_merge(sc.hc_a.f32p(), sc.hc_b.f32p(), d as i64, d as i32, sc.h.f32p(), d as i64, sc.hc_rt.f32p(), t as i32,
+                                      sc.h.f32p(), d as i64, s)
+            },
+            "mHC merge",
+        );
     }
 
     /// tokens を seq の続き（位置 seq.pos から）として 64 層通す。終わると作業場の h [T][d] に最後の層の残差が残る（head で使う）。
@@ -1634,7 +1936,14 @@ impl Model {
         for li in 0..self.layers.len() {
             let il = self.layer0 + li;
             let l = &self.layers[li];
+            let lp = self.cfg.lp;
+            if let Some(hw) = l.hc.as_ref() {
+                self.hc_route(&self.sc, lp.unwrap().mhc_first(il), &hw.attn_w, &hw.attn_b, t, self.st);
+            }
             self.norm(&l.attn_norm, t, path);
+            if l.hc.is_some() {
+                self.hc_zero_h(&self.sc, t, self.st);
+            }
             if let Some(dp) = dump.as_deref_mut() {
                 if dp.want(il) {
                     dp.put("attn_norm", il, d, d2h_f32(self.sc.xa.f32p(), t * d));
@@ -1650,18 +1959,28 @@ impl Model {
                     ai += 1;
                 }
             }
+            if let Some(hw) = l.hc.as_ref() {
+                self.hc_merge(&self.sc, t, self.st);
+                self.hc_route(&self.sc, false, &hw.ffn_w, &hw.ffn_b, t, self.st);
+            }
             if let Some(dp) = dump.as_deref_mut() {
                 if dp.want(il) {
                     dp.put("attn_residual", il, d, d2h_f32(self.sc.h.f32p(), t * d));
                 }
             }
             self.norm(&l.post_norm, t, path);
+            if l.hc.is_some() {
+                self.hc_zero_h(&self.sc, t, self.st);
+            }
             if let Some(dp) = dump.as_deref_mut() {
                 if dp.want(il) {
                     dp.put("attn_post_norm", il, d, d2h_f32(self.sc.xa.f32p(), t * d));
                 }
             }
             self.ffn(l, t, path);
+            if l.hc.is_some() {
+                self.hc_merge(&self.sc, t, self.st);
+            }
             self.finite(self.sc.h.f32p(), t * d, &format!("層 {il} の残差"));
             if let Some(dp) = dump.as_deref_mut() {
                 if dp.h.len() <= li {
@@ -1755,6 +2074,15 @@ impl Model {
         if !self.st.is_null() {
             check(unsafe { kffi::cudaStreamSynchronize(null_mut()) }, "NULL の流れの待ち");
         }
+    }
+
+    /// 自分の流れ（NonBlocking）で KV・状態を読み書きする者（RAM の段の写し）の前に: プレフィルの流れと NULL の流れの両方を待つ。
+    /// ⛔ sync_prefill だけでは足りない: 1 本だけ（max-seqs 1）だと非同期のプレフィルが無く、forward も reset の cudaMemset も
+    ///    NULL の流れに乗るので、sync_prefill は何もせず、写しが終わっていないプレフィル・0 埋めと競る（2026-11-15 の A→B→A の取り違え。
+    ///    b2865d8 で写しを自分の流れにしてから）。MTP の頭も NULL の流れなのでこれで待てる。確定の流れ（cs）は呼ぶ側が sync_commit で待つ
+    pub fn sync_for_copy(&self) {
+        self.sync_prefill();
+        check(unsafe { kffi::cudaStreamSynchronize(null_mut()) }, "NULL の流れの待ち（写しの前）");
     }
 
     /// プレフィルの流れが空いたか（待たない）

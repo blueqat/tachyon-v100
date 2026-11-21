@@ -113,6 +113,14 @@ fn run_case(dir: &str) {
         },
         theta: j["theta"].as_f64().unwrap() as f32,
         eps: j["eps"].as_f64().unwrap() as f32,
+        // YaRN（tools/attn_ref.py の yarn: [freq_scale, ext_factor, mscale, corr0, corr1]、無ければ OFF）
+        yarn: match j["yarn"].as_array() {
+            Some(y) => {
+                let f = |i: usize| y[i].as_f64().unwrap() as f32;
+                tachyon_v100::attn::Yarn { freq_scale: f(0), ext_factor: f(1), mscale: f(2), corr0: f(3), corr1: f(4) }
+            }
+            None => tachyon_v100::attn::Yarn::OFF,
+        },
     };
     let kv8 = gi("kv8") != 0;
     let out_f16 = gi("out_f16") != 0;

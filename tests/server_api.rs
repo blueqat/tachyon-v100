@@ -1176,3 +1176,55 @@ async fn serve_default_shutdown_cancels_inflight() {
     let logs = srv.logs.lock().unwrap().join("\n");
     assert!(logs.contains("\"ev\":\"cancel_all\"") && logs.contains("\"ev\":\"drained\""), "{logs}");
 }
+
+/// --prefix-owner-accounts（2026-11-15）: 載ったアカウントは x-tachyon-prefix-owner の利用者ごとに頭の使い回しを分ける。
+/// ⛔ 別の利用者・札なしの依頼には当てない。載っていないアカウントの札は読まない（前と同じ）。形が変なら 400
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prefix_owner_isolation() {
+    let fake = FakeBackend::new(tok(), FakeConfig::default());
+    let srv = start_with(ServerConfig { prefix_owner_accounts: vec!["cust2".into()], ..cfg() }, fake.clone(), Some(fake)).await;
+    let long = format!("SECRET-OWNER-A {}", "利用者 A だけの長い前置き。".repeat(40));
+    let (ua, ub) = ("a".repeat(32), "b".repeat(32));
+    let go = |key: &'static str, owner: Option<String>, body: Json| {
+        let (base, c) = (srv.base.clone(), srv.c.clone());
+        async move {
+            let mut r = c.post(format!("{base}/v1/chat/completions")).bearer_auth(key).header("content-type", "application/json").body(body.to_string());
+            if let Some(o) = owner {
+                r = r.header("x-tachyon-prefix-owner", o);
+            }
+            let resp = r.send().await.unwrap();
+            let s = resp.status().as_u16();
+            (s, serde_json::from_str::<Json>(&resp.text().await.unwrap()).unwrap())
+        }
+    };
+    let cached = |j: &Json| j["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or_else(|| panic!("{j}"));
+    let (s, a1) = go(K_CUST2, Some(ua.clone()), user(&long)).await;
+    assert_eq!(s, 200, "{a1}");
+    assert_eq!(cached(&a1), 0);
+    let (_, a2) = go(K_CUST2, Some(ua.clone()), user(&long)).await;
+    assert!(cached(&a2) >= 64, "同じ利用者の 2 本目は当たる: {a2}");
+    let (_, b1) = go(K_CUST2, Some(ub.clone()), user(&long)).await;
+    assert_eq!(cached(&b1), 0, "⛔ 別の利用者に A の頭が当たった");
+    let (_, n1) = go(K_CUST2, None, user(&long)).await;
+    assert_eq!(cached(&n1), 0, "⛔ 札なしの依頼に A の頭が当たった");
+    let recs = srv.fake().records();
+    assert_eq!(recs[0].scope.owner, format!("cust2#{ua}"));
+    assert_eq!(recs[0].scope.account, "cust2", "数はアカウントで数える");
+    assert_eq!(recs[3].scope.owner, "cust2");
+    // 載っていないアカウントの札は読まない（同じアカウントの 2 本目は札が違っても当たる＝前と同じ）
+    let short = format!("SECRET-OWNER-C {}", "載っていないアカウントの前置き。".repeat(12));
+    let (_, c1) = go(K_CUST, Some(ua.clone()), user(&short)).await;
+    let (_, c2) = go(K_CUST, Some(ub.clone()), user(&short)).await;
+    assert_eq!(cached(&c1), 0);
+    assert!(cached(&c2) >= 64, "載っていないアカウントは札を見ない: {c2}");
+    assert_eq!(srv.fake().records().last().unwrap().scope.owner, "cust");
+    // 形が変な札は 400（⛔ 黙ってアカウント全体に落とさない）
+    for bad in ["A".repeat(32), "a".repeat(15), "a".repeat(65), "x".repeat(32), "someone@example.com".into()] {
+        let (s, j) = go(K_CUST2, Some(bad.clone()), user("hi")).await;
+        assert_eq!(s, 400, "{bad}: {j}");
+        assert_eq!(j["error"]["param"], "x-tachyon-prefix-owner");
+    }
+    // ログには札の頭 8 字だけ
+    let logs = srv.logs.lock().unwrap().join("\n");
+    assert!(logs.contains("\"owner\":\"aaaaaaaa\"") && !logs.contains(&ua), "{logs}");
+}

@@ -1009,12 +1009,17 @@ const SYS_GET_MEMPOLICY: i64 = 239;
 
 impl HostArena {
     pub fn new(bytes: usize, node: Option<i32>) -> Self {
+        Self::new_opts(bytes, node, true)
+    }
+    /// thp = false: MADV_NOHUGEPAGE（⛔ 2026-11-14 本番: THP の defrag=madvise だと、ページ取りのたびに直のコンパクションが走り
+    /// 1 回 25〜136 秒止まった。頭の控えの RAM の段はこちら）
+    pub fn new_opts(bytes: usize, node: Option<i32>, thp: bool) -> Self {
         let bytes = bytes.max(4096).div_ceil(2 << 20) * (2 << 20);
         unsafe {
             // PROT_READ|WRITE, MAP_PRIVATE|ANONYMOUS|NORESERVE
             let p = ffi::mmap(std::ptr::null_mut(), bytes, 3, 0x02 | 0x20 | 0x4000, -1, 0);
             assert!(p as isize != -1, "mmap {bytes} に失敗");
-            ffi::madvise(p, bytes, 14); // MADV_HUGEPAGE（固定するのも TLB も軽くなる）
+            ffi::madvise(p, bytes, if thp { 14 } else { 15 }); // MADV_HUGEPAGE（固定するのも TLB も軽くなる）か MADV_NOHUGEPAGE
             if let Some(n) = node.filter(|n| (0..64).contains(n)) {
                 let mask: u64 = 1 << n;
                 // MPOL_PREFERRED = 1、flags 0

@@ -10,6 +10,10 @@ use tachyon_v100::server::sampler::{self, History, SamplingParams};
 use std::collections::HashMap;
 
 extern "C" {
+    fn infer_mtp_gumbel(
+        x: *const f32, n: i32, ld: i64, rows: i32, map: *const i32, gp: *const std::ffi::c_void, ws: *mut std::ffi::c_void, kout: i32, oi: *mut i32,
+        s: *mut std::ffi::c_void,
+    ) -> i32;
     fn infer_cand_ws_bytes(rows: i32, n: i32, k: i32) -> i64;
     fn infer_cand_topk(
         lg: *const f32, ld: i64, rows: i32, n: i32, k: i32, temps: *const f32, ws: *mut std::ffi::c_void, ws_bytes: i64, ids: *mut u32, vals: *mut f32,
@@ -108,6 +112,9 @@ fn main() {
     let valid = n - 77; // 終わりの [PAD] は選ばない
     check(unsafe { tachyon_v100::cuda::ffi::cudaSetDevice(0) }, "cudaSetDevice");
     let mut rng = Rng(0x1234_5678_9abc_def1);
+    if args.iter().any(|x| x == "--gumbel") {
+        std::process::exit(gumbel_check(&mut rng));
+    }
     let kinds = ["real", "peaked", "flat", "ties", "nan"];
     let mut hist = History::new(&[11, 1234, 4099, 8198], &SamplingParams { repetition_penalty: 1.1, ..SamplingParams::greedy() });
     for t in [1234u32, 1234, 777, 42, 4099] {
@@ -195,4 +202,74 @@ fn main() {
     }
     println!("{}", if all_ok { "全部 OK" } else { "NG あり" });
     std::process::exit(if all_ok { 0 } else { 1 });
+}
+
+
+/// --gumbel: 結び付けの下書き（TACHYON_HASH_RNG）の GPU の Gumbel が手元の spec::gumbel と同じか・GPU の Gumbel-max の語が手元と同じか
+fn gumbel_check(rng: &mut Rng) -> i32 {
+    use tachyon_v100::mtp::{gpu_gumbel_probe, GParam};
+    use tachyon_v100::spec;
+    let mut bad = 0;
+    // 1. 雑音そのもの
+    let ids: Vec<u32> = (0..20000u32).map(|i| i.wrapping_mul(2654435761) % 248320).collect();
+    let mut maxd = 0f64;
+    for &(seed, pos) in &[(0u64, 0u64), (1, 7), (u64::MAX, 123456789), (0xDEAD_BEEF_1234, 1 << 40)] {
+        let g = gpu_gumbel_probe(seed, pos, &ids);
+        for (i, &id) in ids.iter().enumerate() {
+            let c = spec::gumbel(seed, pos, spec::TAG_SAMPLE, id);
+            maxd = maxd.max((g[i] - c).abs());
+        }
+    }
+    println!("gumbel の雑音: GPU と手元の差の最大 {maxd:.3e}（20000 語 × 4 組）");
+    if maxd > 1e-9 {
+        bad += 1;
+    }
+    // 2. Gumbel-max の語（行 3 本・位置 300・語彙 60960、map あり・なし）
+    let n = 60960usize;
+    let rows = 3usize;
+    let map: Vec<i32> = (0..n as i32).map(|i| ((i as i64 * 7919) % 248320) as i32).collect();
+    let d_x = DevBuf::new(rows * n * 4);
+    let d_map = DevBuf::from_i32(&map);
+    let d_gp = DevBuf::new(rows * std::mem::size_of::<GParam>());
+    let d_ws = DevBuf::new(rows * 8);
+    let d_oi = DevBuf::new(rows * 4);
+    let (mut same, mut tot) = (0, 0);
+    for it in 0..300u64 {
+        let x: Vec<f32> = (0..rows * n).map(|_| rng.normal() * 3.0).collect();
+        let use_map = it % 2 == 1;
+        let gp: Vec<GParam> = (0..rows).map(|r| GParam { seed: 42 + r as u64, pos: 1000 + it, invt: [1.0f32 / 0.7, 1.0, 1.0 / 1.3][r], on: 1 }).collect();
+        let mut oi = vec![-1i32; rows];
+        unsafe {
+            use tachyon_v100::cuda::ffi::cudaMemcpy;
+            check(cudaMemcpy(d_x.ptr, x.as_ptr().cast(), rows * n * 4, 1), "x");
+            check(cudaMemcpy(d_gp.ptr, gp.as_ptr().cast(), rows * std::mem::size_of::<GParam>(), 1), "gp");
+            check(
+                infer_mtp_gumbel(
+                    d_x.ptr as *const f32, n as i32, n as i64, rows as i32, if use_map { d_map.ptr as *const i32 } else { std::ptr::null() },
+                    d_gp.ptr, d_ws.ptr, 1, d_oi.ptr as *mut i32, std::ptr::null_mut(),
+                ),
+                "gumbel",
+            );
+            check(cudaMemcpy(oi.as_mut_ptr().cast(), d_oi.ptr, rows * 4, 2), "oi");
+        }
+        for r in 0..rows {
+            let mut best = (f64::NEG_INFINITY, 0usize);
+            for i in 0..n {
+                // GPU と同じ: f32 に丸めた値で比べ、同点は小さい番号
+                let id = if use_map { map[i] as u32 } else { i as u32 };
+                let v = (x[r * n + i] as f64 * gp[r].invt as f64 + spec::gumbel(gp[r].seed, gp[r].pos, spec::TAG_SAMPLE, id)) as f32 as f64;
+                if v > best.0 {
+                    best = (v, i);
+                }
+            }
+            tot += 1;
+            same += (oi[r] as usize == best.1) as usize;
+        }
+    }
+    println!("Gumbel-max の語: GPU と手元が同じ {same}/{tot}（f32 の丸めの僅差を除けば全部同じはず）");
+    if same * 1000 < tot * 995 {
+        bad += 1;
+    }
+    println!("{}", if bad == 0 { "gumbel: PASS" } else { "gumbel: FAIL" });
+    bad
 }

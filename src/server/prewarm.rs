@@ -40,7 +40,12 @@ fn render(st: &AppState, doc: &Json) -> Result<(String, Vec<u32>), String> {
         return Err("public: true の札だけ（全部のアカウントに当たる文だけを置く）".into());
     }
     let msgs = doc.get("messages").and_then(Json::as_array).ok_or("messages が無い")?.clone();
-    let opts = ChatOptions { add_generation_prompt: false, ..Default::default() };
+    // 依頼と同じ既定で描く（chat.rs の apply_defaults と同じ）: 27B のテンプレートは enable_thinking・reasoning_effort で system の頭に
+    // 「Reasoning effort is set to …」を足すので、既定を入れずに描くと札の語が依頼と頭からずれて当たらない（11-14 に GPU1 で 0 回だった）。
+    // 考えあり・effort 違いの依頼に当てたいときは札に chat_template_kwargs を書く（その形ごとに 1 枚）
+    let kw = doc.get("chat_template_kwargs").cloned().unwrap_or(Json::Null);
+    let mut opts = ChatOptions::from_kwargs(&kw, false).map_err(|e| format!("chat_template_kwargs: {e:?}"))?;
+    super::request::apply_opt_defaults(&mut opts, false, &st.cfg.default_effort, st.cfg.default_thinking);
     let sentinel = rand_id("TACHYON_PREWARM_END_", 20);
     let text = if doc.get("prefix_only").and_then(Json::as_bool) == Some(true) {
         let mut m = msgs;
@@ -118,7 +123,7 @@ pub async fn run(st: Arc<AppState>) {
         let t1 = Instant::now();
         let req = GenRequest {
             id: rand_id("prewarm-", 16),
-            scope: CacheScope { namespace: "_prewarm".into(), account: "_prewarm".into() },
+            scope: CacheScope::fixed("_prewarm"),
             prompt: ids,
             max_tokens: 1,
             sampling: SamplingParams::greedy(),

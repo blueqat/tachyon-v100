@@ -266,7 +266,7 @@ fn cmd_bench(src: &str, rest: &[String]) {
         let mut cur = ctx;
         let t = bench_ms(|| {
             let obs: Vec<spec::Observe<DevRow>> = ids.iter().map(|&id| spec::Observe { seq: id, pos0: cur, tokens: &toks[..na], h: &hrow[..na] }).collect();
-            let asks: Vec<spec::DraftAsk> = ids.iter().map(|&id| spec::DraftAsk { seq: id, id_last: 9, pos: cur + na, k, sample: None }).collect();
+            let asks: Vec<spec::DraftAsk> = ids.iter().map(|&id| spec::DraftAsk { seq: id, id_last: 9, pos: cur + na, k, sample: None, gumbel: None }).collect();
             m.run(&obs, &asks).unwrap();
             cur += na;
         });

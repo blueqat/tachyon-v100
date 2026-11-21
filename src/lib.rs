@@ -5,6 +5,7 @@ pub mod attn;
 pub mod cuda;
 pub mod gdn;
 pub mod gguf;
+pub mod inkling;
 pub mod kv;
 pub mod model;
 pub mod mtp;

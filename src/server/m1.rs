@@ -102,6 +102,9 @@ struct Slot {
     steps: u64,
     drafted: u64,
     accepted: u64,
+    /// HCAP の影の測り（TACHYON_HCAP_SHADOW）: 外れた段で本体の語が下書きの 2・3 番手だった回数
+    /// [外れの歩, 2 番手を全部の段, 2・3 番手を全部の段, 2 番手を自信の最も低い 1 段, 2 番手を低い 2 段, 2・3 番手を最も低い 1 段]
+    hcap: [u64; 6],
 }
 
 /// 頭の使い回し（M2d）: 前の依頼のプロンプトの最後の回の頭の状態の控え。M7 から何個も持つ（prefix_slots）。
@@ -266,6 +269,7 @@ pub fn loader(cfg: M1Config) -> EngineLoader {
                     steps: 0,
                     drafted: 0,
                     accepted: 0,
+                    hcap: [0; 6],
                 })
                 .collect();
             let hbuf = DevBuf::new(m.opt.chunk.max(pr).max(model::GEMV_B_MAX) * d * 4);
@@ -414,7 +418,7 @@ impl M1Engine {
         let s = &mut self.slots[i];
         if s.steps > 0 {
             log(json!({"ev": "mtp", "steps": s.steps, "drafted": s.drafted, "accepted": s.accepted,
-                       "tokens_per_step": (s.steps + s.accepted) as f64 / s.steps as f64,
+                       "tokens_per_step": (s.steps + s.accepted) as f64 / s.steps as f64, "hcap": s.hcap,
                        "cand_fallback_total": self.cand_fallback, "mask_full_total": self.mask_full}));
         }
         let id = s.id.take();
@@ -423,6 +427,7 @@ impl M1Engine {
         s.media_wait = None;
         s.seq.media.clear();
         (s.steps, s.drafted, s.accepted) = (0, 0, 0);
+        s.hcap = [0; 6];
         s.reserved = 0;
         if let Some(x) = self.mtp.as_mut() {
             x.head.free(i as u32);
@@ -697,6 +702,8 @@ impl M1Engine {
         let x = self.mtp.as_mut().unwrap();
         let k = x.k.min(room - 1);
         // 1. MTP: 見せていない本体の行＋下書きの頭を 1 回で、続けて k 段
+        let mut alts: Vec<[u32; 2]> = vec![];
+        let mut confs: Vec<f32> = vec![];
         let mut drafts = if k == 0 {
             if let Some((pp, ptoks)) = pend {
                 let h = Self::rows_at(pb, ptoks.len(), d);
@@ -704,7 +711,7 @@ impl M1Engine {
             }
             vec![]
         } else {
-            let ask = DraftAsk { seq: i as u32, id_last: last, pos: p0, k, sample: None };
+            let ask = DraftAsk { seq: i as u32, id_last: last, pos: p0, k, sample: None, gumbel: hash_draft(&it.sampling) };
             let out = match pend {
                 Some((pp, ptoks)) => {
                     let h = Self::rows_at(pb, ptoks.len(), d);
@@ -712,7 +719,10 @@ impl M1Engine {
                 }
                 None => x.head.run(&[], &[ask])?,
             };
-            out.into_iter().next().ok_or("MTP の下書きが無い")?.tokens
+            let o = out.into_iter().next().ok_or("MTP の下書きが無い")?;
+            alts = o.alts;
+            confs = o.conf;
+            o.tokens
         };
         if let Some(j) = drafts.iter().position(|&t| t as usize >= valid) {
             drafts.truncate(j);
@@ -814,6 +824,19 @@ impl M1Engine {
         s.steps += 1;
         s.drafted += k as u64;
         s.accepted += n_acc as u64;
+        if n_acc < k && alts.len() >= k && confs.len() >= k {
+            // HCAP の影: 段 n_acc で外れた。そこに 2・3 番手を並べていたら、本体の語 new がそれに当たり、1 語多く確定した
+            let [c2, c3] = alts[n_acc];
+            let mut ord: Vec<usize> = (0..k).collect();
+            ord.sort_by(|&a, &b| confs[a].partial_cmp(&confs[b]).unwrap_or(std::cmp::Ordering::Equal));
+            let (h2, h3) = (new == c2, new == c3);
+            s.hcap[0] += 1;
+            s.hcap[1] += h2 as u64;
+            s.hcap[2] += (h2 || h3) as u64;
+            s.hcap[3] += (h2 && ord[0] == n_acc) as u64;
+            s.hcap[4] += (h2 && ord[..2.min(k)].contains(&n_acc)) as u64;
+            s.hcap[5] += ((h2 || h3) && ord[0] == n_acc) as u64;
+        }
         let mut outv = drafts[..n_acc].to_vec();
         outv.push(new);
         Ok(ItemOut::Tokens(outv))
@@ -855,7 +878,7 @@ impl M1Engine {
                 let pos = (p0s[r] + 1) as u64;
                 let cm = it.constraint.as_deref();
                 let pc = match cm {
-                    Some(m) => cands.as_ref().and_then(|c| sampler::prepare_cands_masked(&c[r], sp, hist, m)).map(|pr| pr.draw(sampler::uniform(sp.seed, pos), None)),
+                    Some(m) => cands.as_ref().and_then(|c| sampler::prepare_cands_masked(&c[r], sp, hist, m)).map(|pr| pr.pick(&sp, pos)),
                     None => cands.as_ref().and_then(|c| sampler::sample_cands(&c[r], sp, hist, pos)),
                 };
                 match pc {
@@ -867,7 +890,7 @@ impl M1Engine {
                         ItemOut::Token(match cm {
                             Some(m) => {
                                 self.mask_full += 1;
-                                sampler::prepare_masked(row, self.valid_vocab, sp, hist, m).draw(sampler::uniform(sp.seed, pos), None)
+                                sampler::prepare_masked(row, self.valid_vocab, sp, hist, m).pick(&sp, pos)
                             }
                             None => sampler::sample(row, self.valid_vocab, sp, hist, pos),
                         })
@@ -919,7 +942,7 @@ impl M1Engine {
             }
             let kk = kb.min(room - 1);
             if kk > 0 {
-                asks.push(DraftAsk { seq: i as u32, id_last: items[k].tokens[0], pos: p0, k: kk, sample: None });
+                asks.push(DraftAsk { seq: i as u32, id_last: items[k].tokens[0], pos: p0, k: kk, sample: None, gumbel: hash_draft(&items[k].sampling) });
             }
         }
         let obs: Vec<Observe<DevRow>> = obs_data.iter().map(|(s, p, t, h)| Observe { seq: *s, pos0: *p, tokens: t, h }).collect();
@@ -1169,6 +1192,8 @@ impl M1Engine {
         let gpu: Vec<Vec<(*mut u8, usize)>> = pages[..np].iter().map(|&pg| self.page_spans(pg)).collect();
         let st = self.slots[i].seq.state_spans();
         let h = (self.hrest.ptr.cast::<u8>(), self.m.cfg.d * 4);
+        // ⛔ reset の 0 埋め（NULL の流れ）が写しの後に走ると、戻した GDN の状態が 0 になる。写しは別の流れなので先に待つ
+        self.m.sync_for_copy();
         let host = self.host.as_mut().unwrap();
         let n = host.restore(idx, &gpu, st, h)?;
         let toks = host.toks(idx).to_vec();
@@ -1198,7 +1223,8 @@ impl M1Engine {
             return;
         }
         self.m.sync_commit();
-        self.m.sync_prefill();
+        // ⛔ 直前の塊の forward が NULL の流れにまだ積まれていることがある（max-seqs 1）。写しは別の流れなので両方を待つ
+        self.m.sync_for_copy();
         let pages = self.slots[i].seq.pages_vec();
         let np = l.div_ceil(super::hostcache::PAGE);
         if pages.len() < np {
@@ -1343,7 +1369,17 @@ impl Engine for M1Engine {
             .max_by_key(|&j| self.pcs[j].toks.len());
         let gpu_len = hit.map_or(0, |j| self.pcs[j].toks.len());
         // RAM の段: GPU の控えより 1 頁以上長く当たるなら、そちらを戻す
-        let host_hit = self.host.as_ref().and_then(|h| h.find(scope, prompt)).filter(|&(_, l)| l > gpu_len + super::hostcache::PAGE);
+        // 札との一致の長さ（2048 語以上の依頼だけ・位置の数だけ）。札が当たらない理由を見る
+        if prompt.len() >= 2048 {
+            if let Some(h) = self.host.as_ref() {
+                let v: Vec<_> = h.pin_lcp(prompt).into_iter().map(|(n, l, t)| json!({"name": n, "same": l, "of": t})).collect();
+                if !v.is_empty() {
+                    log(json!({"ev": "prefix_pin_lcp", "prompt": prompt.len(), "pins": v}));
+                }
+            }
+        }
+        // ⛔ 遅い写しの後の休み中は当てない（ふつうのプレフィル）
+        let host_hit = self.host.as_mut().and_then(|h| if h.paused() { None } else { h.find(scope, prompt) }).filter(|&(_, l)| l > gpu_len + super::hostcache::PAGE);
         if let Some((idx, _)) = host_hit {
             match catch_unwind(AssertUnwindSafe(|| self.host_restore(i, idx))) {
                 Ok(Ok(l)) => {
@@ -1447,6 +1483,14 @@ impl Engine for M1Engine {
 }
 
 /// 確定を別の流れで次の確かめに重ねる（既定 true。TACHYON_NO_COMMIT_STREAM=1 で前の道）
+/// 結び付けの下書き（TACHYON_HASH_RNG=1・温度 > 0）: MTP の語を本体と同じ雑音の Gumbel-max で選ぶ
+fn hash_draft(sp: &sampler::SamplingParams) -> Option<(u64, f32)> {
+    // TACHYON_HASH_DRAFT_TSCALE（既定 1）: 下書きの温度 = 本体の温度 × これ（小さいほど argmax に近い。本体の分布は変わらない）
+    static SC: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    let sc = *SC.get_or_init(|| std::env::var("TACHYON_HASH_DRAFT_TSCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0));
+    (sampler::hash_rng_on() && !sp.is_greedy()).then(|| (sp.seed, sp.temperature * sc))
+}
+
 fn commit_stream() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("TACHYON_NO_COMMIT_STREAM").map_or(true, |v| v != "1"))

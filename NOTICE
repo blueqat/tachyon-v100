@@ -14,6 +14,26 @@ This product includes material from the following third-party projects
 * Qwen3.8-27B chat template (Apache License 2.0, Copyright 2026 Alibaba Cloud)
   - tests/data/qwen38/chat_template.jinja (unmodified, test fixture)
 
+* SenseNova-Loop (Apache License 2.0, Copyright SenseTime / OpenSenseNova)
+  - src/model.rs (LoopCfg), kernels/mhc.cu: looped execution and two-stream mHC written against the official
+    modeling_sensenova_loop.py (github.com/OpenSenseNova/SenseNova-Loop, commit e19d541) and the GGUF layout of
+    OpenSenseNova/llama.cpp (commit 24ea7bb). No code copied.
+  - tools/loop_ref.py runs the official code as a reference; tools/loop_hf_from_gguf.py reverses the official GGUF conversion.
+
+* Inkling-2-Mini reference implementations
+  - src/inkling.rs, kernels/inkling.cu: written against the Inkling implementation in the transformers pull request #51050
+    (Apache License 2.0, Copyright The HuggingFace Team and contributors) and the llama.cpp pull request #32694
+    (MIT License, The ggml authors). No code copied. tools/ink_ref.py runs the transformers implementation as a reference.
+
+* YASAKANI (Apache License 2.0, Copyright 2026 the YASAKANI authors, https://github.com/yasakani-dev/yasakani)
+  - The ideas behind TACHYON_HASH_RNG (sampling noise keyed by seed, position and token, shared by the MTP draft and the
+    target) and TACHYON_HCAP_SHADOW follow YASAKANI docs/TECHNOLOGY.md section 5.3. The implementation (src/mtp.rs,
+    kernels/mtp.cu, src/server/sampler.rs, src/server/m1.rs) is our own. No YASAKANI code or model files are included.
+
 Model weights are not included. Qwen3.8-27B and Qwen3.6-35B-A3B are released by the
 Qwen team under the Apache License 2.0; their GGUF conversions are published by
 unsloth and ggml-org on Hugging Face under the same license.
+SenseNova-Loop-9B is released by SenseTime / OpenSenseNova under the Apache License 2.0.
+Inkling-2-Mini is released by Thinking Machines Lab, Inc. under the Apache License 2.0 and is additionally subject to the
+Thinking Machines Lab Model Acceptable Use Policy (https://thinkingmachines.ai/model-acceptable-use-policy/); its GGUF
+conversion is published by ggml-org.

@@ -23,12 +23,34 @@ pub struct CacheScope {
     pub namespace: String,
     /// 使った頁・当たりの数をアカウントごとに数えるため
     pub account: String,
+    /// 頭の使い回しの控えの持ち主（M1 の GPU の控え・RAM の段が見る）。既定はアカウントの名前と同じ。
+    /// 前段の中継（proxy）のように 1 つの鍵で大勢を代表するアカウントは、--prefix-owner-accounts に載せると
+    /// 依頼の x-tachyon-prefix-owner（利用者の名前を前段で HMAC した 16 進）で "<アカウント>#<16 進>" に分ける（2026-11-15）。
+    /// ⛔ 違う持ち主の控えには当てない（public の札だけは別。hostcache.rs）
+    pub owner: String,
+}
+
+/// 持ち主の札（x-tachyon-prefix-owner）の形: 16〜64 字の小文字の 16 進
+pub fn valid_owner_tag(t: &str) -> bool {
+    (16..=64).contains(&t.len()) && t.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 impl CacheScope {
     pub fn for_account(account: &str, internal: bool) -> Self {
         let namespace = if internal { "internal".to_string() } else { format!("acct:{account}") };
-        CacheScope { namespace, account: account.to_string() }
+        CacheScope { namespace, account: account.to_string(), owner: account.to_string() }
+    }
+
+    /// 決まった名前の持ち主（_health・_prewarm）
+    pub fn fixed(name: &str) -> Self {
+        CacheScope { namespace: name.to_string(), account: name.to_string(), owner: name.to_string() }
+    }
+
+    /// アカウントの中をさらに利用者で分ける（tag は valid_owner_tag を通った物。アカウントの名前に # は入らない）
+    pub fn with_owner(mut self, tag: &str) -> Self {
+        self.namespace = format!("{}#{tag}", self.namespace);
+        self.owner = format!("{}#{tag}", self.account);
+        self
     }
 }
 

@@ -45,8 +45,18 @@ pub(crate) fn user_start_of(ids: &[u32], turn_start: Option<usize>, im_start: u3
 /// 描く・切る（長い文は時間がかかるので spawn_blocking の中で呼ぶ）。
 /// scope: 切り分けの覚えの持ち主（⛔ アカウントの名前。アカウントをまたいで覚えを使わない）。
 /// max_tokens を超えたら、そこで切り分けをやめて 400（長すぎる依頼を全部切ってから断らない）
+/// Inkling で考えを飛ばす印（ChatOptions.extra に入れる。テンプレートは読まない名前）
+pub(crate) const INK_NOTHINK: &str = "__tachyon_ink_nothink";
+/// 考えの床で effort を上げた印（ChatOptions.extra。テンプレートは読まない名前）
+pub(crate) const INK_FLOORED: &str = "__tachyon_ink_floored";
+pub(crate) const INK_FLOOR_SKIPPED: &str = "__tachyon_ink_floor_skipped";
+
 pub(crate) fn prepare(st: &AppState, scope: &str, max_tokens: usize, messages: &Json, tools: Option<&Json>, opts: &ChatOptions) -> Result<Prepared, ApiError> {
-    let text = st.tpl.render(messages, tools, opts).map_err(|e| template_error(&e))?;
+    let mut text = st.tpl.render(messages, tools, opts).map_err(|e| template_error(&e))?;
+    // Inkling: reasoning_effort "none" でも考えを書くので、答えの頭（<|message_model|><|content_text|>）まで描いて考えを飛ばす
+    if st.tok.ink.is_some() && opts.extra.get(INK_NOTHINK).is_some_and(|v| v == &Json::Bool(true)) {
+        text.push_str("<|message_model|><|content_text|>");
+    }
     let ids = st.tok.encode_limited(Some(scope), &text, max_tokens).map_err(|e| match e {
         crate::tokenizer::EncodeError::TooLong { at_least } => ApiError::bad(
             "context_length_exceeded",
@@ -55,6 +65,13 @@ pub(crate) fn prepare(st: &AppState, scope: &str, max_tokens: usize, messages: &
         ),
         crate::tokenizer::EncodeError::Failed(e) => ApiError::internal("tokenizer_error", format!("tokenizer: {e}")),
     })?;
+    if let Some(k) = st.tok.ink {
+        // 頭の使い回しの区切り: 最後の回（<|message_*|>）の頭
+        // ⚠️ 考えを飛ばす前置き（末尾の <|message_model|><|content_text|>）は区切りに数えない（数えると控えが問いを含んで当たらない）
+        let body = if text.ends_with("<|message_model|><|content_text|>") && ids.len() >= 2 { &ids[..ids.len() - 2] } else { &ids[..] };
+        let turn_start = body.iter().rposition(|&t| k.is_message_start(t)).filter(|&i| i > 0);
+        return Ok(Prepared { tail: prompt_tail(&text).to_string(), ids, system_end: None, turn_start, user_start: None });
+    }
     let system_end = if text.starts_with("<|im_start|>system\n") { ids.iter().skip(1).position(|&t| t == st.tok.ids.im_start).map(|i| i + 1) } else { None };
     let turn_start = ids.iter().rposition(|&t| t == st.tok.ids.im_start).filter(|&i| i > 0);
     let user_start = user_start_of(&ids, turn_start, st.tok.ids.im_start);
@@ -121,9 +138,28 @@ pub async fn chat_completions(State(st): State<Arc<AppState>>, headers: HeaderMa
         Ok(a) => a,
         Err(e) => return st.reject(None, EP_CHAT, e),
     };
-    match chat_inner(&st, &acct, t0, &body).await {
+    let owner = match prefix_owner(&st, &acct, &headers) {
+        Ok(o) => o,
+        Err(e) => return st.reject(Some(&acct), EP_CHAT, e),
+    };
+    match chat_inner(&st, &acct, t0, &body, owner.as_deref()).await {
         Ok(r) => r,
         Err(e) => st.reject(Some(&acct), EP_CHAT, e),
+    }
+}
+
+/// 頭の使い回しの持ち主の札（x-tachyon-prefix-owner）。--prefix-owner-accounts に載ったアカウントのときだけ読む
+/// （ほかのアカウントの札は見ない＝前と同じ）。載ったアカウントで形が変なら 400（⛔ 黙ってアカウント全体の控えに落とさない）
+pub(crate) const PREFIX_OWNER_HEADER: &str = "x-tachyon-prefix-owner";
+
+fn prefix_owner(st: &AppState, acct: &Account, h: &HeaderMap) -> Result<Option<String>, ApiError> {
+    if !st.cfg.prefix_owner_accounts.iter().any(|a| *a == acct.name) {
+        return Ok(None);
+    }
+    let Some(v) = h.get(PREFIX_OWNER_HEADER) else { return Ok(None) };
+    match v.to_str() {
+        Ok(t) if super::backend::valid_owner_tag(t) => Ok(Some(t.to_string())),
+        _ => Err(ApiError::bad("invalid_value", Some(PREFIX_OWNER_HEADER), "x-tachyon-prefix-owner must be 16-64 lowercase hex characters")),
     }
 }
 
@@ -146,7 +182,7 @@ fn attach_document(st: &AppState, acct: &Account, p: &mut ChatParams) -> Result<
 /// 考えの上限に達したときに差し込む文（Qwen の model card の推奨と同じ）
 const THINK_CLOSE: &str = "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>\n\n";
 
-async fn chat_inner(st: &Arc<AppState>, acct: &Arc<Account>, t0: Instant, body: &[u8]) -> Result<Response, ApiError> {
+async fn chat_inner(st: &Arc<AppState>, acct: &Arc<Account>, t0: Instant, body: &[u8], owner: Option<&str>) -> Result<Response, ApiError> {
     st.check_ready()?;
     acct.take_rate().map_err(|wait| ApiError::limit("rate_limit_exceeded", wait, format!("rate limit for this key reached ({} requests/min)", acct.rpm.unwrap_or(0))))?;
     let guard = acct.enter().ok_or_else(|| ApiError::limit("too_many_concurrent_requests", 1, format!("this key may run {} requests at once", acct.max_concurrent.unwrap_or(0))))?;
@@ -154,18 +190,64 @@ async fn chat_inner(st: &Arc<AppState>, acct: &Arc<Account>, t0: Instant, body: 
     let slot = InflightSlot::take(st).ok_or_else(|| ApiError::limit("server_busy", 1, "the server is busy; retry later"))?;
     let mut p = request::parse_chat_limited(body, &st.cfg.chat_limits())?;
     let doc = attach_document(st, acct, &mut p)?;
+    let (exp_think, exp_eff) = (p.opts.enable_thinking, p.opts.reasoning_effort.clone());
     p.apply_defaults(&st.cfg.default_effort, st.cfg.default_thinking);
-    let thinking = p.opts.thinking();
+    let ink = st.tok.ink;
+    if ink.is_some() {
+        // Inkling の型は enable_thinking を読まない: 考えるかを reasoning_effort に寄せる。
+        // 考えないとき（enable_thinking=false か effort "none"・0）は effort "none" で描き、答えの頭まで描いて考えを本当に飛ばす
+        let nothink = match (exp_think, &exp_eff) {
+            (Some(false), _) => true,
+            (_, Some(e)) => crate::template::ink_effort_is_none(e),
+            (Some(true), None) => false,
+            (None, None) => !st.cfg.default_thinking,
+        };
+        if nothink {
+            p.opts.reasoning_effort = Some("none".into());
+            p.opts.extra.insert(INK_NOTHINK.into(), Json::Bool(true));
+        }
+        p.opts.enable_thinking = Some(!nothink);
+    }
     let max_ctx = st.max_context_for(acct);
     let max_prompt = st.max_prompt_for(acct);
-    let (st2, msgs, tools, opts, scope) = (st.clone(), p.messages.clone(), p.render_tools(), p.opts.clone(), acct.name.clone());
-    let (prep, media) = tokio::task::spawn_blocking(move || -> Result<(Prepared, Vec<Arc<MediaInput>>), ApiError> {
+    // Inkling の考えの床: 考えなしの依頼でも、長い（--ink-nothink-floor-tokens 語を超える）か文書つきなら effort を床（既定 low）に上げる。
+    // 考えなしの Inkling は長い文書の答えを「文書に書かれていない」と断るため（notes/inkling2.md 6 節）。語数は描いて切ってから分かるので、上げるときは描き直す
+    let floor = (ink.is_some() && st.cfg.ink_nothink_floor_tokens > 0 && p.opts.extra.contains_key(INK_NOTHINK))
+        .then(|| (st.cfg.ink_nothink_floor_tokens, st.cfg.ink_nothink_floor_effort.clone(), doc.as_ref().map(|d| Arc::new(d.tokens.clone()))));
+    let (st2, msgs, tools, mut opts, scope) = (st.clone(), p.messages.clone(), p.render_tools(), p.opts.clone(), acct.name.clone());
+    let (prep, media, opts) = tokio::task::spawn_blocking(move || -> Result<(Prepared, Vec<Arc<MediaInput>>, ChatOptions), ApiError> {
         let mut prep = prepare(&st2, &scope, max_prompt, &msgs, tools.as_ref(), &opts)?;
+        if let Some((n, eff, doc_tokens)) = floor {
+            if doc_tokens.is_some() || prep.ids.len() > n {
+                let mut o2 = opts.clone();
+                o2.extra.remove(INK_NOTHINK);
+                o2.reasoning_effort = Some(eff);
+                o2.enable_thinking = Some(true);
+                o2.extra.insert(INK_FLOORED.into(), Json::Bool(true));
+                let p2 = prepare(&st2, &scope, max_prompt, &msgs, tools.as_ref(), &o2)?;
+                // 文書（documents）は作ったときの effort で頭が描かれている。上げて頭が合わなくなるなら上げない（document_mismatch にしない）
+                if doc_tokens.as_ref().map_or(true, |d: &Arc<Vec<u32>>| p2.ids.starts_with(d)) {
+                    (prep, opts) = (p2, o2);
+                } else {
+                    opts.extra.insert(INK_FLOOR_SKIPPED.into(), Json::Bool(true));
+                }
+            }
+        }
         let media = if st2.cfg.images { prepare_media(&st2, &msgs, &mut prep)? } else { vec![] };
-        Ok((prep, media))
+        Ok((prep, media, opts))
     })
     .await
     .map_err(|e| ApiError::internal("prepare_failed", e.to_string()))??;
+    let floored = opts.extra.contains_key(INK_FLOORED);
+    if opts.extra.contains_key(INK_FLOOR_SKIPPED) {
+        st.log_json(serde_json::json!({"ev": "ink_effort_floor_skip", "account": acct.name, "reason": "document_prefix"}));
+    }
+    if floored {
+        st.log_json(serde_json::json!({"ev": "ink_effort_floor", "account": acct.name, "prompt_tokens": prep.ids.len(), "document": doc.is_some(),
+                                       "effort": opts.reasoning_effort, "think_budget": st.cfg.ink_nothink_floor_budget}));
+    }
+    p.opts = opts;
+    let thinking = p.opts.thinking();
     if !media.is_empty() && doc.is_some() {
         return Err(ApiError::bad("unsupported_content", Some("messages"), "images cannot be used together with a document"));
     }
@@ -182,7 +264,11 @@ async fn chat_inner(st: &Arc<AppState>, acct: &Arc<Account>, t0: Instant, body: 
     if n > max_prompt {
         return Err(ApiError::bad("context_length_exceeded", Some("messages"), format!("the prompt is {n} tokens; this key allows at most {max_prompt} tokens per request (prompts are not truncated)")));
     }
-    let want = p.max_tokens.unwrap_or(st.cfg.default_max_tokens).min(st.cfg.max_output).min(acct.max_tokens.unwrap_or(usize::MAX)).max(1);
+    let mut want = p.max_tokens.unwrap_or(st.cfg.default_max_tokens).min(st.cfg.max_output).min(acct.max_tokens.unwrap_or(usize::MAX)).max(1);
+    if floored {
+        // 頼まれたのは答えだけの分。考えの上限の分を足す（考えで答えが切れないように。足した後も口・鍵の上限の内）
+        want = (want + st.cfg.ink_nothink_floor_budget).min(st.cfg.max_output).min(acct.max_tokens.unwrap_or(usize::MAX));
+    }
     let room = max_ctx - n;
     if room < want.min(st.cfg.min_room) {
         return Err(ApiError::bad("context_length_exceeded", Some("messages"), format!("the prompt is {n} tokens; only {room} of {max_ctx} tokens are left for the output")));
@@ -192,7 +278,10 @@ async fn chat_inner(st: &Arc<AppState>, acct: &Arc<Account>, t0: Instant, body: 
     let sampling = p.sampling.resolve(thinking, rand_u64());
     let req = GenRequest {
         id: id.clone(),
-        scope: CacheScope::for_account(&acct.name, acct.internal),
+        scope: match owner {
+            Some(t) => CacheScope::for_account(&acct.name, acct.internal).with_owner(t),
+            None => CacheScope::for_account(&acct.name, acct.internal),
+        },
         prompt: prep.ids,
         max_tokens,
         sampling,
@@ -206,13 +295,18 @@ async fn chat_inner(st: &Arc<AppState>, acct: &Arc<Account>, t0: Instant, body: 
         },
         priority: Priority::Normal,
         // 考えの上限は、プロンプトが <think> を開いたまま終わる（考えて書き始める）ときだけ
-        think_budget: match p.think_budget {
+        think_budget: match (if floored { Some(p.think_budget.unwrap_or(st.cfg.ink_nothink_floor_budget).min(st.cfg.ink_nothink_floor_budget)) } else { p.think_budget }, ink) {
+            // Inkling: 考え（<|content_thinking|> の中）は <|end_message|> で終わる。上限で答えの頭を差し込む
+            (Some(b), Some(k)) if thinking => Some(super::backend::ThinkBudget { budget: b, close: vec![k.end_message, k.message_model, k.content_text], end: k.end_message }),
+            (_, Some(_)) => None,
+            (pb, None) => match pb {
             Some(b) if thinking && super::output::prompt_opens_think(&prep.tail) => Some(super::backend::ThinkBudget {
                 budget: b,
                 close: st.tok.encode(THINK_CLOSE).map_err(|e| ApiError::internal("tokenizer_error", format!("tokenizer: {e}")))?,
                 end: st.tok.ids.think_end,
             }),
             _ => None,
+            },
         },
         // JSON の形: 考えて書き始めるなら </think> の後から絞る
         constraint: p.response_format.clone().map(|sc| super::jsonc::Matcher::new(sc, st.toktab(), thinking && super::output::prompt_opens_think(&prep.tail))),
@@ -220,6 +314,8 @@ async fn chat_inner(st: &Arc<AppState>, acct: &Arc<Account>, t0: Instant, body: 
     };
     let gen = st.backend.submit(req).map_err(submit_error)?;
     let mut track = Track::new(st, &id, acct, guard, slot, t0, n, p.stream);
+    // ログには札の頭 8 字だけ（利用者ごとの当たりを数えるため。札は前段で HMAC した物で、名前には戻らない）
+    track.owner = owner.and_then(|t| t.get(..8)).map(String::from);
     track.max_tokens = max_tokens;
     let ctx = Ctx { id, model: p.model.clone().unwrap_or_else(|| st.model_id.clone()), created: unix_secs(), tail: prep.tail, tools: p.tools.clone(), tool_choice: p.tool_choice.clone(), stops: p.stop.clone(), include_usage: p.include_usage };
     Ok(if p.stream { stream(st.clone(), ctx, track, gen) } else { collect(st, ctx, track, gen).await })
@@ -277,6 +373,8 @@ pub(crate) struct Track {
     finish: &'static str,
     status: u16,
     error: Option<String>,
+    /// 持ち主の札の頭 8 字（x-tachyon-prefix-owner を使った依頼だけ）
+    owner: Option<String>,
     done: bool,
     _guard: super::auth::InflightGuard,
     _slot: InflightSlot,
@@ -303,6 +401,7 @@ impl Track {
             finish: "client_closed",
             status: 499,
             error: None,
+            owner: None,
             done: false,
             _guard: guard,
             _slot: slot,
@@ -400,12 +499,16 @@ impl Drop for Track {
         });
         // ⛔ 中身は残さない: 誰が・いつ・何語・どれだけかかったか・どう終わったか
         let ms = |x: Option<f64>| x.map(|s| (s * 1000.0).round() as u64);
-        self.st.log_json(json!({
+        let mut v = json!({
             "ev": "chat", "id": self.id, "account": self.account.name, "status": self.status, "stream": self.stream,
             "prompt": self.prompt, "cached": self.cached, "completion": self.completion, "reasoning": self.reasoning,
             "max_tokens": self.max_tokens, "finish": self.finish, "queue_ms": ms(queue), "ttft_ms": ms(ttft),
             "ms": (total * 1000.0).round() as u64, "tps": decode_tps.map(|x| (x * 10.0).round() / 10.0), "error": self.error,
-        }));
+        });
+        if let Some(o) = &self.owner {
+            v["owner"] = o.as_str().into();
+        }
+        self.st.log_json(v);
     }
 }
 
@@ -639,7 +742,7 @@ pub(crate) async fn probe(st: &Arc<AppState>) -> Result<Probe, String> {
     let prep = tokio::task::spawn_blocking(move || prepare(&st2, "probe:health", 4096, &msgs, None, &opts)).await.map_err(|e| e.to_string())?.map_err(|e| e.message)?;
     let req = GenRequest {
         id: rand_id("probe-", 16),
-        scope: CacheScope { namespace: "_health".into(), account: "_health".into() },
+        scope: CacheScope::fixed("_health"),
         prompt: prep.ids,
         max_tokens: 2,
         sampling: SamplingParams::greedy(),

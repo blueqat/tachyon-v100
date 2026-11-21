@@ -34,6 +34,10 @@ mod kffi {
         pub fn infer_mtp_feed(top: *const i32, kout: i32, src: *const i32, map: *const i32, n: i32, dst: *mut i32, s: Stream) -> i32;
         pub fn infer_mtp_copy_rows(dst: *const *mut f32, src: *const *const f32, k: i32, rows: i32, s: Stream) -> i32;
         pub fn infer_mtp_topk_ws_bytes(n: i32, rows: i32, k: i32) -> i64;
+        pub fn infer_mtp_gumbel(
+            x: *const f32, n: i32, ld: i64, rows: i32, map: *const i32, gp: *const c_void, ws: *mut c_void, kout: i32, oi: *mut i32, s: Stream,
+        ) -> i32;
+        pub fn infer_mtp_gumbel_probe(seed: u64, pos: u64, ids: *const u32, n: i32, out: *mut f64, s: Stream) -> i32;
         pub fn infer_g3_gemm_ex(
             nmat: i32, qtypes: *const i32, ws: *const *const c_void, ns: *const i32, ys: *const *mut c_void, ldys: *const i32, k: i32, m: i32,
             x: *const c_void, xlo: *const c_void, ldx: i32, mode: i32, cfg: i32, s: Stream,
@@ -99,6 +103,40 @@ pub struct MtpMoe {
 
 /// 1 回で流せる行の上限（g3 の B の上限）
 pub const MAX_ROWS: usize = 32;
+
+/// 結び付けの下書き（TACHYON_HASH_RNG）の 1 行の引数（kernels/mtp.cu の GParam と同じ並び・24 バイト）
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GParam {
+    pub seed: u64,
+    pub pos: u64,
+    pub invt: f32,
+    pub on: i32,
+}
+/// 段ごとの GParam の置き場（段 j は j*MAX_ROWS 行目から）
+const G_STAGES: usize = 16;
+
+/// 下書きの j 段目（位置 ask.pos + j + 1 の語）の結び付けの引数
+fn gparam(ask: &DraftAsk, j: usize) -> GParam {
+    match ask.gumbel {
+        Some((seed, t)) if ask.sample.is_none() && t > 1e-5 => GParam { seed, pos: (ask.pos + j + 1) as u64, invt: 1.0 / t, on: 1 },
+        _ => GParam::default(),
+    }
+}
+
+/// 確かめ用: GPU の Gumbel（kernels/mtp.cu の gumbel_d）を ids について（手元の spec::gumbel と同じか）
+pub fn gpu_gumbel_probe(seed: u64, pos: u64, ids: &[u32]) -> Vec<f64> {
+    let n = ids.len();
+    let d_ids = DevBuf::new(n * 4);
+    let d_out = DevBuf::new(n * 8);
+    let mut out = vec![0f64; n];
+    unsafe {
+        cuda::check(ffi::cudaMemcpy(d_ids.ptr, ids.as_ptr().cast(), n * 4, 1), "probe H2D");
+        cuda::check(kffi::infer_mtp_gumbel_probe(seed, pos, d_ids.ptr as *const u32, n as i32, d_out.ptr as *mut f64, null_mut()), "probe");
+        cuda::check(ffi::cudaMemcpy(out.as_mut_ptr().cast(), d_out.ptr, n * 8, 2), "probe D2H");
+    }
+    out
+}
 /// 追いつき（下書きを出さない行）を GEMM の道（forward_gemm）で 1 回に流す行の上限
 pub const GEMM_ROWS: usize = 512;
 
@@ -437,6 +475,11 @@ pub struct MtpHead {
     draft_ids_dev: Option<DevBuf>,
     /// 頭の 3 段を手元に戻らず続けて流す（既定 true。TACHYON_NO_MTP_CHAIN=1 で切る）
     pub chain: bool,
+    /// HCAP の影の測り（TACHYON_HCAP_SHADOW=1）: 下書きの段ごとに 2・3 番手を手元で数えて DraftOut::alts に（chain は切る・遅い。測るだけ）
+    pub hcap_shadow: bool,
+    /// 結び付けの下書きの引数（GPU。G_STAGES × MAX_ROWS 行）と作業場（行ごとに 8 バイト）
+    gp_dev: DevBuf,
+    gkey: DevBuf,
     /// 升ごとの前の h（本体の最後の行の h_nextn）
     pend: DevBuf,
     /// pend の位置（本体のどの位置の h か）
@@ -512,7 +555,7 @@ impl MtpHead {
         if opts.topk == 0 || opts.topk > MAX_TOPK || opts.slots == 0 || opts.max_ctx == 0 {
             return Err("MtpOpts が変".into());
         }
-        let ash = attn::Shape { h: n_head, hkv: n_head_kv, n_rot, sections, theta, eps };
+        let ash = attn::Shape { h: n_head, hkv: n_head_kv, n_rot, sections, theta, eps, yarn: attn::yarn_for(n_rot, theta, attn::gguf_rope_scaling(g)) };
         for n in ["nextn.embed_tokens.weight", "nextn.shared_head_head.weight"] {
             if g.get(&p(n)).is_some() {
                 return Err(format!("{}: まだ扱っていない（この 2 つの GGUF には無い）", p(n)));
@@ -679,6 +722,9 @@ impl MtpHead {
             meta_ch: [Meta::new(r, pages_per_slot, opts.slots), Meta::new(r, pages_per_slot, opts.slots)],
             draft_ids_dev: None,
             chain: std::env::var("TACHYON_NO_MTP_CHAIN").map_or(true, |v| v != "1"),
+            hcap_shadow: std::env::var("TACHYON_HCAP_SHADOW").map_or(false, |v| v == "1"),
+            gp_dev: DevBuf::new(G_STAGES * MAX_ROWS * std::mem::size_of::<GParam>()),
+            gkey: DevBuf::new(G_STAGES * MAX_ROWS * 8),
             pend: fb(slots * n_embd),
             pend_pos: vec![None; slots],
             committed: vec![0; slots],
@@ -792,12 +838,34 @@ impl MtpHead {
     /// 1 回の MTP（rows ≤ 32 行）。行は升ごとに続いた位置で並べる（升の塊が Attention の列になる）。
     /// KV の位置 pos に書く。want の行だけ logits を出して上位 kout（≤ opts.topk）を返す
     pub fn forward(&mut self, rows: &[Row], want: &[usize], kout: usize) -> Result<Vec<TopRow>, String> {
+        self.forward_g(rows, want, kout, None)
+    }
+
+    /// GParam を段 stage の置き場に送る（行は want の順）。どの行も off なら None
+    fn put_g(&mut self, stage: usize, g: &[GParam]) -> Option<usize> {
+        if g.is_empty() || !g.iter().any(|x| x.on != 0) || stage >= G_STAGES || g.len() > MAX_ROWS {
+            return None;
+        }
+        let off = stage * MAX_ROWS;
+        let sz = std::mem::size_of::<GParam>();
+        unsafe {
+            cuda::check(
+                ffi::cudaMemcpy((self.gp_dev.ptr as *mut u8).add(off * sz).cast(), g.as_ptr().cast(), g.len() * sz, 1),
+                "gparam H2D",
+            );
+        }
+        Some(off)
+    }
+
+    /// forward に、want の行の下書きを Gumbel-max で選び直す引数（g。want と同じ数）を足した物
+    pub fn forward_g(&mut self, rows: &[Row], want: &[usize], kout: usize, g: Option<&[GParam]>) -> Result<Vec<TopRow>, String> {
         if rows.is_empty() {
             return Ok(vec![]);
         }
+        let goff = g.and_then(|g| self.put_g(0, g));
         let (p, n) = self.plan(0, rows, want, kout)?;
         self.meta.upload(n);
-        self.enq(0, &p, kout, 0, None)?;
+        self.enq(0, &p, kout, 0, None, goff)?;
         if want.is_empty() {
             return Ok(vec![]);
         }
@@ -868,7 +936,7 @@ impl MtpHead {
 
     /// meta（mi 番。送ってあること）の行を流す。上位 kout を top_* の toff 行目から書く。
     /// feed が Some(ftop) なら、まず top_i の ftop 行目から（meta の feed の行の順で）語を拾って入力の語にする
-    fn enq(&mut self, mi: usize, p: &Plan, kout: usize, toff: usize, feed: Option<usize>) -> Result<(), String> {
+    fn enq(&mut self, mi: usize, p: &Plan, kout: usize, toff: usize, feed: Option<usize>, goff: Option<usize>) -> Result<(), String> {
         let d = self.dims;
         let (e, hd, kvd) = (d.n_embd, d.n_head * d.head_dim, d.n_head_kv * d.head_dim);
         let s: Stream = null_mut();
@@ -998,6 +1066,19 @@ impl MtpHead {
             },
             "topk",
         )?;
+        if let Some(go) = goff {
+            let map = self.draft_ids_dev.as_ref().filter(|_| self.draft_vocab.is_some() && self.trace.is_none()).map_or(null(), |x| x.ptr as *const i32);
+            let sz = std::mem::size_of::<GParam>();
+            ck(
+                unsafe {
+                    kffi::infer_mtp_gumbel(
+                        self.logits.f32p(), v as i32, v as i64, nw, map, (self.gp_dev.ptr as *const u8).add(go * sz).cast(),
+                        (self.gkey.ptr as *mut u8).add(go * 8).cast(), kout as i32, (self.top_i.ptr as *mut i32).add(toff * kout), s,
+                    )
+                },
+                "gumbel",
+            )?;
+        }
         Ok(())
     }
 
@@ -1009,6 +1090,10 @@ impl MtpHead {
         let mut plans = vec![(p0, n0)];
         let mut buf = self.cur ^ 1; // 1 段目が書く h' の置き場
         let mut prev: Vec<(usize, usize)> = (0..heads.len()).map(|hi| (hi, want0[hi])).collect(); // (列, 前の段の h' の行)
+        // 段ごとの結び付けの引数（行は want の順 = 列の順）
+        let mut goffs: Vec<Option<usize>> = vec![];
+        let g0: Vec<GParam> = (0..heads.len()).map(|hi| gparam(&asks[hi], 0)).collect();
+        goffs.push(self.put_g(0, &g0));
         for j in 1..n_ch {
             let live: Vec<(usize, usize, usize)> =
                 prev.iter().enumerate().filter(|(_, &(hi, _))| asks[hi].k > j).map(|(ti, &(hi, hr))| (ti, hi, hr)).collect();
@@ -1020,6 +1105,8 @@ impl MtpHead {
                 live.iter().map(|&(_, hi, hr)| Row { slot: heads[hi].slot, pos: asks[hi].pos + j, token: 0, h: unsafe { hb.add(hr * e) } }).collect();
             let want: Vec<usize> = (0..rows.len()).collect();
             let (pj, nj) = self.plan(j, &rows, &want, 1)?;
+            let gj: Vec<GParam> = live.iter().map(|&(_, hi, _)| gparam(&asks[hi], j)).collect();
+            goffs.push(self.put_g(j, &gj));
             let src: Vec<i32> = live.iter().map(|&(ti, _, _)| ti as i32).collect();
             let m = self.meta_at(j);
             let f = m.feed;
@@ -1036,7 +1123,7 @@ impl MtpHead {
         let mut toff = 0;
         for (j, (p, _)) in plans.iter().enumerate() {
             let feed = if j == 0 { None } else { Some(segs.last().map_or(0, |&(o, _): &(usize, usize)| o)) };
-            self.enq(j, p, 1, toff, feed)?;
+            self.enq(j, p, 1, toff, feed, goffs[j])?;
             segs.push((toff, p.nw));
             toff += p.nw;
         }
@@ -1451,6 +1538,7 @@ impl MtpHead {
     }
 
     fn pick(&self, t: &TopRow, ask: &DraftAsk, j: usize) -> (u32, Option<spec::Dist>) {
+        // 結び付け（ask.gumbel）なら t.ids[0] は GPU の Gumbel-max で選び直した語（enq の gumbel）
         match ask.sample {
             None => (t.ids[0], None),
             Some((smp, seed, coupled)) => {
@@ -1460,6 +1548,54 @@ impl MtpHead {
                 (spec::sample(&q, seed, (ask.pos + j + 1) as u64, tag), Some(q))
             }
         }
+    }
+
+    /// HCAP の影: 最後の forward の logits の row 行目（want の順）から 2・3 番手（下書きと同じ取り方: 結び付けなら Gumbel をのせた値）
+    fn alts_of(&self, row: usize, ask: &DraftAsk, j: usize) -> [u32; 2] {
+        let lg = self.logits_row(row);
+        let n = match &self.draft_vocab {
+            Some((m, _)) if self.trace.is_none() => m.n,
+            _ => self.w.output.n,
+        };
+        let ids = self.draft_vocab.as_ref().filter(|_| self.trace.is_none()).map(|(_, ids)| ids);
+        let id_of = |i: usize| ids.map_or(i as u32, |v| v[i]);
+        let g = gparam(ask, j);
+        // 3 番目に大きい logit（G は [−3.62, 37.43]: 53 ビットの一様から。上位 3 つに入れない値は計算しない＝結果は同じ）
+        let mut l3 = [f32::NEG_INFINITY; 3];
+        for &l in &lg[..n] {
+            if l > l3[2] {
+                l3[2] = l;
+                if l3[2] > l3[1] {
+                    l3.swap(1, 2);
+                    if l3[1] > l3[0] {
+                        l3.swap(0, 1);
+                    }
+                }
+            }
+        }
+        let mx = l3[2];
+        let mut best: [(f64, u32); 3] = [(f64::NEG_INFINITY, u32::MAX); 3];
+        for i in 0..n {
+            let l = lg[i];
+            let v = if g.on != 0 {
+                if ((l - mx) as f64) * (g.invt as f64) < -41.5 {
+                    continue;
+                }
+                ((l as f64) * (g.invt as f64) + spec::gumbel(g.seed, g.pos, spec::TAG_SAMPLE, id_of(i))) as f32 as f64
+            } else {
+                l as f64
+            };
+            if v > best[2].0 {
+                best[2] = (v, id_of(i));
+                if best[2].0 > best[1].0 {
+                    best.swap(1, 2);
+                    if best[1].0 > best[0].0 {
+                        best.swap(0, 1);
+                    }
+                }
+            }
+        }
+        [best[1].1, best[2].1]
     }
 
     /// 下書きの行を記録する（tops と want は forward に渡した順。logits の行も want の順）
@@ -1560,14 +1696,15 @@ impl Drafter<DevRow> for MtpHead {
         // 頭の 3 段を手元に戻らず続けて流せるか（argmax の下書き・確からしさで止めない段だけ。記録の時は使わない）
         let kmax = asks.iter().map(|a| a.k).max().unwrap_or(0);
         let thr0 = if asks.iter().all(|a| a.sample.is_none()) { self.draft_min_p } else { 0.0 };
-        let use_chain = self.chain && kout == 1 && self.trace.is_none() && thr0 <= 0.0 && kmax >= 2 && !heads.is_empty();
+        let use_chain = self.chain && !self.hcap_shadow && kout == 1 && self.trace.is_none() && thr0 <= 0.0 && kmax >= 2 && !heads.is_empty();
         let mut pre: Vec<Vec<TopRow>> = vec![];
         if all.len() <= MAX_ROWS && use_chain {
             pre = self.chain_run(&all, &head_at, &heads, asks, kmax.min(CHAIN))?;
             tops = std::mem::take(&mut pre[0]);
             head_row = head_at.clone();
         } else if all.len() <= MAX_ROWS {
-            tops = self.forward(&all, &head_at, kout)?;
+            let g0: Vec<GParam> = (0..heads.len()).map(|hi| gparam(&asks[hi], 0)).collect();
+            tops = self.forward_g(&all, &head_at, kout, Some(&g0))?;
             head_row = head_at.clone();
             self.record(&tops, &head_at);
         } else {
@@ -1597,7 +1734,8 @@ impl Drafter<DevRow> for MtpHead {
                 head_row = want;
             } else if !heads.is_empty() {
                 let want: Vec<usize> = (0..heads.len()).collect();
-                tops = self.forward(&heads, &want, kout)?;
+                let g0: Vec<GParam> = (0..heads.len()).map(|hi| gparam(&asks[hi], 0)).collect();
+                tops = self.forward_g(&heads, &want, kout, Some(&g0))?;
                 self.record(&tops, &want);
                 head_row = want;
             }
@@ -1631,6 +1769,11 @@ impl Drafter<DevRow> for MtpHead {
             }
             let (tk, q) = self.pick(&tops[hi], a, 0);
             outs[hi].tokens.push(tk);
+            if self.hcap_shadow {
+                let al = self.alts_of(hi, a, 0);
+                outs[hi].alts.push(al);
+                outs[hi].conf.push(conf(&tops[hi]));
+            }
             if let Some(q) = q {
                 qs[hi].push(q);
             }
@@ -1654,7 +1797,8 @@ impl Drafter<DevRow> for MtpHead {
                 }
                 std::mem::take(&mut pre[j])
             } else {
-                self.forward(&rows2, &want, kout)?
+                let gj: Vec<GParam> = live.iter().map(|&hi| gparam(&asks[hi], j)).collect();
+                self.forward_g(&rows2, &want, kout, Some(&gj))?
             };
             self.record(&t2, &want);
             if let Some(l) = self.log.as_mut() {
@@ -1672,6 +1816,11 @@ impl Drafter<DevRow> for MtpHead {
                 }
                 let (tk, q) = self.pick(&t2[r], &asks[hi], j);
                 outs[hi].tokens.push(tk);
+                if self.hcap_shadow {
+                    let al = self.alts_of(r, &asks[hi], j);
+                    outs[hi].alts.push(al);
+                    outs[hi].conf.push(conf(&t2[r]));
+                }
                 if let Some(q) = q {
                     qs[hi].push(q);
                 }

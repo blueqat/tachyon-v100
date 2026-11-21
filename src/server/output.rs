@@ -2,7 +2,7 @@
 //! 止める語（eos など）は語の番号で、止めの文字列（OpenAI の stop）は文字で見る。
 //! 止めの文字列は考えも含めた出力全体に当てる（vLLM・llama.cpp と同じ）。
 use crate::template::{OutEvent, OutputParser, ToolCall};
-use crate::tokenizer::{DecodeStream, Tokenizer};
+use crate::tokenizer::{DecodeStream, InkIds, Tokenizer};
 use serde_json::Value as Json;
 
 /// 描いたプロンプトが `<think>` を開いたまま終わっているか（考えありの生成。OutputParser::for_prompt と同じ見方）
@@ -11,9 +11,30 @@ pub fn prompt_opens_think(prompt: &str) -> bool {
     tail.rfind("<think>") > tail.rfind("</think>")
 }
 
-/// プロンプトの最後の回（`<|im_start|>` から）。出力の分け方に要るのはここだけ
+/// プロンプトの最後の回（`<|im_start|>` から。Inkling は `<|message_` から）。出力の分け方に要るのはここだけ
 pub fn prompt_tail(prompt: &str) -> &str {
-    &prompt[prompt.rfind("<|im_start|>").unwrap_or(0)..]
+    let i = prompt.rfind("<|im_start|>").or_else(|| prompt.rfind("<|message_")).unwrap_or(0);
+    &prompt[i..]
+}
+
+/// Inkling の出力の区切り（tokenizer_config の response_template と同じ見方）:
+///   [<|message_model|>名前?] <|content_thinking|> 考え <|end_message|>
+///   [<|message_model|>名前?] <|content_text|>（・content_tool_error・content_invoke_tool_text）答え <|end_message|>
+///   [<|message_model|>名前?] <|content_invoke_tool_json|> {"name":…,"args":{…}} <|end_message|>
+///   …（何回でも）… <|content_model_end_sampling|>（止める語）
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum InkSeg {
+    /// 区切りの外（<|message_model|> の後の名前もここ）
+    Between,
+    Think,
+    Text,
+    ToolJson,
+}
+
+struct InkState {
+    ids: InkIds,
+    seg: InkSeg,
+    tool_buf: String,
 }
 
 /// 止めの文字列。どれかの頭かもしれない末尾は次まで持つ
@@ -82,6 +103,7 @@ pub struct OutputPipe<'t> {
     think_end: u32,
     tool_call: u32,
     in_reasoning: bool,
+    ink: Option<InkState>,
     /// 出した語の数（止める語も数える＝usage.completion_tokens）
     pub n_tokens: usize,
     /// そのうち考えの語（`</think>` まで）
@@ -103,6 +125,8 @@ impl<'t> OutputPipe<'t> {
             think_end: tok.ids.think_end,
             tool_call: tok.ids.tool_call,
             in_reasoning: prompt_opens_think(prompt),
+            // Inkling: 考えを飛ばす前置き（…<|message_model|><|content_text|>）で終わるなら答えから
+            ink: tok.ink.map(|ids| InkState { ids, seg: if prompt.ends_with("<|content_text|>") { InkSeg::Text } else { InkSeg::Between }, tool_buf: String::new() }),
             n_tokens: 0,
             n_reasoning: 0,
             stopped: None,
@@ -133,6 +157,9 @@ impl<'t> OutputPipe<'t> {
             return vec![];
         }
         self.n_tokens += 1;
+        if self.ink.is_some() {
+            return self.push_ink(id);
+        }
         if self.n_tokens == 1 && !self.in_reasoning && id == self.think {
             self.in_reasoning = true; // 答えの頭で <think> を開いた
         }
@@ -156,6 +183,87 @@ impl<'t> OutputPipe<'t> {
         ev
     }
 
+    /// Inkling の 1 語（役の語で区切りを変え、文字は今の区切りの種類で出す）
+    fn push_ink(&mut self, id: u32) -> Vec<OutEvent> {
+        let st = self.ink.as_ref().unwrap();
+        let k = st.ids;
+        let seg = st.seg;
+        let mut ev = vec![];
+        let is_mark = id == k.message_model
+            || id == k.content_thinking
+            || id == k.content_text
+            || id == k.content_tool_error
+            || id == k.content_invoke_tool_text
+            || id == k.content_invoke_tool_json
+            || id == k.end_message;
+        if is_mark {
+            // 区切りの前の文字（UTF-8 の途中など）を出し切る
+            let rest = self.ds.flush();
+            ev.extend(self.ink_text(seg, &rest));
+            if self.is_done() {
+                return ev;
+            }
+            let st = self.ink.as_mut().unwrap();
+            if id == k.end_message && seg == InkSeg::ToolJson {
+                let buf = std::mem::take(&mut st.tool_buf);
+                match serde_json::from_str::<Json>(buf.trim()) {
+                    Ok(Json::Object(o)) => {
+                        let name = o.get("name").and_then(Json::as_str).unwrap_or("").to_string();
+                        let arguments = match o.get("args").or_else(|| o.get("arguments")) {
+                            Some(Json::Object(a)) => a.clone(),
+                            _ => serde_json::Map::new(),
+                        };
+                        ev.push(OutEvent::ToolCall(ToolCall { name, arguments }));
+                    }
+                    // 読めない呼び出しは答えの文字として返す（黙って捨てない）
+                    _ => ev.push(OutEvent::Content(buf)),
+                }
+            }
+            st.seg = if id == k.content_thinking {
+                InkSeg::Think
+            } else if id == k.content_text || id == k.content_tool_error || id == k.content_invoke_tool_text {
+                InkSeg::Text
+            } else if id == k.content_invoke_tool_json {
+                InkSeg::ToolJson
+            } else {
+                InkSeg::Between
+            };
+            if seg == InkSeg::Think || st.seg == InkSeg::Think {
+                self.n_reasoning += 1;
+            }
+            return ev;
+        }
+        if seg == InkSeg::Think {
+            self.n_reasoning += 1;
+        }
+        let text = self.ds.step(id);
+        self.ink_text(seg, &text)
+    }
+
+    fn ink_text(&mut self, seg: InkSeg, text: &str) -> Vec<OutEvent> {
+        if text.is_empty() {
+            return vec![];
+        }
+        match seg {
+            // 呼び出しの名前（<|message_model|>名前）は見ない
+            InkSeg::Between => vec![],
+            InkSeg::ToolJson => {
+                self.ink.as_mut().unwrap().tool_buf.push_str(text);
+                vec![]
+            }
+            InkSeg::Think | InkSeg::Text => {
+                let (out, hit) = self.stops.push(text);
+                if hit {
+                    self.stopped = Some(Stopped::String);
+                }
+                if out.is_empty() {
+                    return vec![];
+                }
+                vec![if seg == InkSeg::Think { OutEvent::Reasoning(out) } else { OutEvent::Content(out) }]
+            }
+        }
+    }
+
     /// 終わり: 持っている文字（UTF-8 の途中・止めの文字列の頭かもしれない所）を全部出す
     pub fn finish(&mut self) -> Vec<OutEvent> {
         if self.finished {
@@ -164,6 +272,21 @@ impl<'t> OutputPipe<'t> {
         self.finished = true;
         if self.stopped == Some(Stopped::String) {
             return vec![]; // 当たった時に出し切っている
+        }
+        if let Some(st) = &self.ink {
+            let seg = st.seg;
+            let rest = self.ds.flush();
+            let mut ev = self.ink_text(seg, &rest);
+            let tail = self.stops.flush();
+            if !tail.is_empty() && matches!(seg, InkSeg::Think | InkSeg::Text) {
+                ev.push(if seg == InkSeg::Think { OutEvent::Reasoning(tail) } else { OutEvent::Content(tail) });
+            }
+            // 長さで切れた呼び出しは答えの文字として返す
+            let buf = std::mem::take(&mut self.ink.as_mut().unwrap().tool_buf);
+            if !buf.is_empty() {
+                ev.push(OutEvent::Content(buf));
+            }
+            return ev;
         }
         let mut text = self.ds.flush();
         let (out, hit) = self.stops.push(&text);

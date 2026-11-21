@@ -85,6 +85,29 @@ pub struct SpecialIds {
     pub video_pad: u32,
 }
 
+/// Inkling-2（Thinking Machines）の役の語。Qwen の語（<|im_start|> など）は無い
+#[derive(Clone, Copy, Debug)]
+pub struct InkIds {
+    pub message_user: u32,
+    pub message_model: u32,
+    pub message_system: u32,
+    pub message_tool: u32,
+    pub content_text: u32,
+    pub content_thinking: u32,
+    pub content_tool_error: u32,
+    pub content_invoke_tool_json: u32,
+    pub content_invoke_tool_text: u32,
+    pub end_message: u32,
+    pub end_sampling: u32,
+}
+
+impl InkIds {
+    /// 回の頭の語（頭の使い回しの区切り）
+    pub fn is_message_start(&self, t: u32) -> bool {
+        t == self.message_user || t == self.message_model || t == self.message_system || t == self.message_tool
+    }
+}
+
 pub struct Tokenizer {
     hf: tokenizers::Tokenizer,
     /// 文を区切って切り分けてよいか（added token の中に「<」・改行・数字が無いこと。Qwen3.8 は満たす）
@@ -96,6 +119,8 @@ pub struct Tokenizer {
     /// id → special な added token か（skip_special で飛ばす）
     special: Vec<bool>,
     pub ids: SpecialIds,
+    /// Inkling の語（tokenizer に <|message_model|> があるとき）
+    pub ink: Option<InkIds>,
     /// 生成を止める語（generation_config.json の eos_token_id。無ければ <|im_end|> と <|endoftext|>）
     pub eos: Vec<u32>,
 }
@@ -168,7 +193,32 @@ impl Tokenizer {
                 special[id as usize] = a.special;
             }
         }
-        let id = |s: &str| hf.token_to_id(s).ok_or_else(|| format!("語が無い: {s}"));
+        let ink = match hf.token_to_id("<|message_model|>") {
+            None => None,
+            Some(_) => {
+                let g = |s: &str| hf.token_to_id(s).ok_or_else(|| format!("語が無い: {s}"));
+                Some(InkIds {
+                    message_user: g("<|message_user|>")?,
+                    message_model: g("<|message_model|>")?,
+                    message_system: g("<|message_system|>")?,
+                    message_tool: g("<|message_tool|>")?,
+                    content_text: g("<|content_text|>")?,
+                    content_thinking: g("<|content_thinking|>")?,
+                    content_tool_error: g("<|content_tool_error|>")?,
+                    content_invoke_tool_json: g("<|content_invoke_tool_json|>")?,
+                    content_invoke_tool_text: g("<|content_invoke_tool_text|>")?,
+                    end_message: g("<|end_message|>")?,
+                    end_sampling: g("<|content_model_end_sampling|>")?,
+                })
+            }
+        };
+        // Inkling には Qwen の役の語が無い: 無い語は u32::MAX（どの語とも当たらない）にする
+        let is_ink = ink.is_some();
+        let id = |s: &str| match hf.token_to_id(s) {
+            Some(v) => Ok(v),
+            None if is_ink => Ok(u32::MAX),
+            None => Err(format!("語が無い: {s}")),
+        };
         let ids = SpecialIds {
             endoftext: id("<|endoftext|>")?,
             im_start: id("<|im_start|>")?,
@@ -184,14 +234,17 @@ impl Tokenizer {
             image_pad: id("<|image_pad|>")?,
             video_pad: id("<|video_pad|>")?,
         };
-        let eos = vec![ids.im_end, ids.endoftext];
+        let eos = match &ink {
+            Some(k) => vec![k.end_sampling],
+            None => vec![ids.im_end, ids.endoftext],
+        };
         // added token は正規化・前の切り分けより先に文から抜き出される（leftmost-longest）。
         // added token の中（2 文字目以降）に「<」・改行・数字が無ければ、<|im_start|> の手前と is_cut の所は
         // added token の途中にならない → そこで分けて切っても同じ番号になる
         let can_split = added.values().all(|a| {
             !a.content.contains('\n') && !a.content.chars().skip(1).any(|c| c == '<' || c.is_ascii_digit()) && !a.lstrip && !a.rstrip && !a.single_word && !a.normalized
         });
-        Ok(Self { hf, can_split, cache: Caches::default(), bytes, special, ids, eos })
+        Ok(Self { hf, can_split: can_split && !is_ink, cache: Caches::default(), bytes, special, ids, ink, eos })
     }
 
     /// 文字列 → 語の番号。chat_template で描いた文をそのまま渡す前提で、

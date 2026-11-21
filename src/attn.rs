@@ -46,6 +46,12 @@ pub struct RopeParams {
     pub kv8: i32,
     pub eps: f32,
     pub theta: f32,
+    /// YaRN（Yarn::OFF なら 1, 0, 1, 0, 0 で、カーネルは前と同じ式を通る）
+    pub freq_scale: f32,
+    pub ext_factor: f32,
+    pub mscale: f32,
+    pub corr0: f32,
+    pub corr1: f32,
 }
 
 /// kernels/attn.cu の AttnParams と同じ並び
@@ -107,10 +113,113 @@ pub struct Shape {
     pub sections: [i32; 4],
     pub theta: f32,
     pub eps: f32,
+    pub yarn: Yarn,
+}
+
+/// RoPE の YaRN（llama.cpp の ggml rope_yarn と HF の _compute_yarn_parameters と同じ式）。
+///   角度 θ_i = pos·base^(−2i/n_rot)。補間 θ_i·freq_scale と外挿 θ_i を、組の番号 i の傾き
+///   ramp(i) = 1 − clamp((i − corr0)/max(0.001, corr1 − corr0), 0, 1) で混ぜる: θ = θ_interp·(1 − ramp·ext) + θ_extrap·ramp·ext。
+///   cos・sin に attn_factor·(1 + 0.1·ln(1/freq_scale)) を掛ける（q と k の両方に掛かるので logits は その 2 乗倍）。
+///   ここの mscale は ggml の attn_factor（既定 1）で、(1 + 0.1·ln) はカーネルの中で掛ける（ggml と同じ分け方）。
+///   corr0 = max(0, floor(c(beta_fast)))、corr1 = min(n_rot − 1, ceil(c(beta_slow)))、c(b) = n_rot·ln(orig/(2π·b))/(2·ln base)。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Yarn {
+    pub freq_scale: f32,
+    pub ext_factor: f32,
+    pub mscale: f32,
+    pub corr0: f32,
+    pub corr1: f32,
+}
+
+impl Yarn {
+    pub const OFF: Yarn = Yarn { freq_scale: 1.0, ext_factor: 0.0, mscale: 1.0, corr0: 0.0, corr1: 0.0 };
+    /// カーネルに渡す float[5]
+    pub fn as_arr(&self) -> [f32; 5] {
+        [self.freq_scale, self.ext_factor, self.mscale, self.corr0, self.corr1]
+    }
+    pub fn is_off(&self) -> bool {
+        *self == Yarn::OFF
+    }
+    /// factor（例 4）・orig（元の文脈。例 262144）・attn_factor（既定 1）・beta_fast 32・beta_slow 1
+    pub fn new(factor: f32, orig: usize, n_rot: usize, base: f32, attn_factor: f32, beta_fast: f32, beta_slow: f32) -> Yarn {
+        let fs = 1.0 / factor;
+        let c = |b: f32| n_rot as f32 * (orig as f32 / (b * 2.0 * std::f32::consts::PI)).ln() / (2.0 * base.ln());
+        let corr0 = c(beta_fast).floor().max(0.0);
+        let corr1 = c(beta_slow).ceil().min(n_rot as f32 - 1.0);
+        Yarn { freq_scale: fs, ext_factor: 1.0, mscale: attn_factor, corr0, corr1 }
+    }
+}
+
+/// 処理全体の RoPE の伸ばし方（CLI の --rope-scaling yarn --rope-factor F --rope-orig N で、重みを読む前に決める）。
+/// 決めていなければ GGUF の {arch}.rope.scaling.* を見る（llama.cpp の書き方）。どちらも無ければ OFF。
+#[derive(Clone, Copy, Debug)]
+pub struct RopeScaling {
+    pub factor: f32,
+    pub orig: usize,
+    pub attn_factor: f32,
+    pub beta_fast: f32,
+    pub beta_slow: f32,
+}
+
+static ROPE_SCALING: std::sync::OnceLock<Option<RopeScaling>> = std::sync::OnceLock::new();
+static KV8: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// 本体の KV を int8（32 要素ごとに f32 の係数 = 1 ベクトル 288 バイト、fp16 の 56%）にするか（CLI の --kv8。重みを読む前に決める）。
+/// MTP の頭の KV は fp16 のまま。2 回目以降は無視
+pub fn set_kv8(on: bool) -> bool {
+    let _ = KV8.set(on);
+    kv8()
+}
+pub fn kv8() -> bool {
+    KV8.get().copied().unwrap_or(false)
+}
+
+/// 引数（"rope-scaling" 等の値を返す関数）から決める。2 回目以降は無視（最初の物が残る）
+pub fn set_rope_scaling_from(get: &dyn Fn(&str) -> Option<String>) -> Result<Option<RopeScaling>, String> {
+    let kind = get("rope-scaling");
+    let rs = match kind.as_deref() {
+        None | Some("none") => None,
+        Some("yarn") => {
+            let f = |k: &str, d: f32| -> Result<f32, String> {
+                get(k).map(|v| v.parse::<f32>().map_err(|_| format!("--{k} は数"))).transpose().map(|v| v.unwrap_or(d))
+            };
+            let factor = f("rope-factor", 4.0)?;
+            let orig = f("rope-orig", 262144.0)? as usize;
+            if !(factor > 1.0) || orig == 0 {
+                return Err("--rope-factor は 1 より大きく、--rope-orig は正の数".into());
+            }
+            Some(RopeScaling { factor, orig, attn_factor: f("rope-attn-factor", 1.0)?, beta_fast: f("yarn-beta-fast", 32.0)?, beta_slow: f("yarn-beta-slow", 1.0)? })
+        }
+        Some(x) => return Err(format!("--rope-scaling は yarn か none（{x}）")),
+    };
+    let _ = ROPE_SCALING.set(rs);
+    Ok(*ROPE_SCALING.get().unwrap())
+}
+
+/// 形を作るときの YaRN。CLI で決めた物 → GGUF の rope.scaling.*（type = yarn のときだけ）→ OFF
+pub fn yarn_for(n_rot: usize, base: f32, gguf_scaling: Option<RopeScaling>) -> Yarn {
+    match ROPE_SCALING.get().copied().flatten().or(gguf_scaling) {
+        Some(r) => Yarn::new(r.factor, r.orig, n_rot, base, r.attn_factor, r.beta_fast, r.beta_slow),
+        None => Yarn::OFF,
+    }
+}
+
+/// GGUF の {arch}.rope.scaling.type = "yarn" と factor・original_context_length・attn_factor（llama.cpp の書き方）
+pub fn gguf_rope_scaling(m: &crate::gguf::Model) -> Option<RopeScaling> {
+    if m.hp("rope.scaling.type")?.as_str()? != "yarn" {
+        return None;
+    }
+    Some(RopeScaling {
+        factor: m.hp_f32("rope.scaling.factor")?,
+        orig: m.hp_u32("rope.scaling.original_context_length")? as usize,
+        attn_factor: m.hp_f32("rope.scaling.attn_factor").unwrap_or(1.0),
+        beta_fast: m.hp_f32("rope.scaling.yarn_beta_fast").unwrap_or(32.0),
+        beta_slow: m.hp_f32("rope.scaling.yarn_beta_slow").unwrap_or(1.0),
+    })
 }
 
 impl Shape {
-    pub const QWEN38_27B: Shape = Shape { h: 24, hkv: 4, n_rot: 64, sections: [11, 11, 10, 0], theta: 1e7, eps: 1e-6 };
+    pub const QWEN38_27B: Shape = Shape { h: 24, hkv: 4, n_rot: 64, sections: [11, 11, 10, 0], theta: 1e7, eps: 1e-6, yarn: Yarn::OFF };
     /// 1 ページ・1 層の K（または V）のバイト数
     pub fn page_bytes(&self, kv8: bool) -> usize {
         self.hkv * PAGE * D * if kv8 { 1 } else { 2 }
@@ -148,6 +257,11 @@ impl RopeParams {
             kv8: 0,
             eps: sh.eps,
             theta: sh.theta,
+            freq_scale: sh.yarn.freq_scale,
+            ext_factor: sh.yarn.ext_factor,
+            mscale: sh.yarn.mscale,
+            corr0: sh.yarn.corr0,
+            corr1: sh.yarn.corr1,
         }
     }
 }

@@ -12,6 +12,29 @@ use std::path::Path;
 
 /// Qwen3.8 の chat_template が受け付ける reasoning_effort（Flash-Next・27B で同じ。既定は xhigh）
 pub const EFFORTS: [&str; 3] = ["xhigh", "medium", "low"];
+/// Inkling-2 の chat_template の reasoning_effort（文字。数 0〜0.99 も受ける＝"num:<数>" で持つ）
+pub const INK_EFFORTS: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// テンプレートが Inkling の形（<|message_model|>）か。1 つのプロセスに 1 つのモデルなので全体で持つ
+pub static INKLING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn is_inkling() -> bool {
+    INKLING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// この口が受ける reasoning_effort の名前
+pub fn efforts() -> &'static [&'static str] {
+    if is_inkling() { &INK_EFFORTS } else { &EFFORTS }
+}
+
+/// reasoning_effort が受けられるか（Inkling は "num:0.5" の形の数も）
+pub fn effort_ok(e: &str) -> bool {
+    efforts().contains(&e) || (is_inkling() && e.strip_prefix("num:").and_then(|x| x.parse::<f64>().ok()).is_some_and(|x| (0.0..=0.99).contains(&x)))
+}
+
+/// Inkling で考えないか（"none"・数 0）
+pub fn ink_effort_is_none(e: &str) -> bool {
+    e == "none" || e.strip_prefix("num:").and_then(|x| x.parse::<f64>().ok()) == Some(0.0)
+}
 
 const NAME: &str = "chat";
 /// raise_exception の印（minijinja の誤りの中から見分ける）
@@ -32,7 +55,7 @@ pub enum TemplateError {
 impl fmt::Display for TemplateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TemplateError::BadEffort(e) => write!(f, "reasoning_effort は {} のどれか（{e:?} は使えない）", EFFORTS.join("・")),
+            TemplateError::BadEffort(e) => write!(f, "reasoning_effort は {} のどれか（{e:?} は使えない）", efforts().join("・")),
             TemplateError::Raised(m) => write!(f, "{m}"),
             TemplateError::BadRequest(m) => write!(f, "{m}"),
             TemplateError::Template(m) => write!(f, "chat_template: {m}"),
@@ -69,7 +92,12 @@ impl ChatOptions {
                 "enable_thinking" => o.enable_thinking = Some(v.as_bool().ok_or_else(|| bad(k, "true/false"))?),
                 "preserve_thinking" => o.preserve_thinking = Some(v.as_bool().ok_or_else(|| bad(k, "true/false"))?),
                 "add_vision_id" => o.add_vision_id = Some(v.as_bool().ok_or_else(|| bad(k, "true/false"))?),
-                "reasoning_effort" => o.reasoning_effort = Some(v.as_str().ok_or_else(|| bad(k, "文字列"))?.to_string()),
+                "reasoning_effort" => {
+                    o.reasoning_effort = Some(match v {
+                        Json::Number(n) if is_inkling() => format!("num:{}", n.as_f64().unwrap_or(-1.0)),
+                        _ => v.as_str().ok_or_else(|| bad(k, "文字列"))?.to_string(),
+                    })
+                }
                 "messages" | "tools" | "add_generation_prompt" => return Err(bad(k, "ここでは渡せない")),
                 _ => {
                     o.extra.insert(k.clone(), v.clone());
@@ -87,7 +115,7 @@ impl ChatOptions {
     /// reasoning_effort の確かめ。テンプレートは考えるときしか見ないが、API では常に誤りにする
     pub fn validate(&self) -> Result<(), TemplateError> {
         match &self.reasoning_effort {
-            Some(e) if !EFFORTS.contains(&e.as_str()) => Err(TemplateError::BadEffort(e.clone())),
+            Some(e) if !effort_ok(e) => Err(TemplateError::BadEffort(e.clone())),
             _ => Ok(()),
         }
     }
@@ -120,6 +148,9 @@ impl ChatTemplate {
             Err(minijinja::Error::new(ErrorKind::InvalidOperation, format!("{RAISE}{msg}")))
         });
         env.add_template_owned(NAME, strip_generation(source)).map_err(terr)?;
+        if source.contains("<|message_model|>") {
+            INKLING.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(Self { env })
     }
 
@@ -143,7 +174,13 @@ impl ChatTemplate {
             }
         };
         put("enable_thinking", opt.enable_thinking.map(Json::from));
-        put("reasoning_effort", opt.reasoning_effort.clone().map(Json::from));
+        put(
+            "reasoning_effort",
+            opt.reasoning_effort.clone().map(|e| match e.strip_prefix("num:").and_then(|x| x.parse::<f64>().ok()) {
+                Some(x) => Json::from(x),
+                None => Json::from(e),
+            }),
+        );
         put("preserve_thinking", opt.preserve_thinking.map(Json::from));
         put("add_vision_id", opt.add_vision_id.map(Json::from));
         let t = self.env.get_template(NAME).map_err(|e| TemplateError::Template(format!("{e:#}")))?;

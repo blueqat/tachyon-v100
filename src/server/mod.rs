@@ -16,6 +16,7 @@ pub mod engine;
 pub mod jsonc;
 pub mod fake;
 pub mod hostcache;
+pub mod ink;
 pub mod m1;
 pub mod metrics;
 pub mod output;
@@ -28,7 +29,7 @@ pub use auth::{Account, Auth, KeysFile};
 pub use backend::*;
 pub use engine::{Engine, EngineInfo, ItemOut, SchedConfig, SimpleScheduler, StepItem};
 
-use crate::template::{ChatOptions, ChatTemplate, EFFORTS};
+use crate::template::{efforts, ChatOptions, ChatTemplate};
 use crate::tokenizer::Tokenizer;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -79,6 +80,13 @@ pub struct ServerConfig {
     pub max_image_bytes: usize,
     /// reasoning_effort を書かない依頼に入れる値（docs/API.md 3: medium）
     pub default_effort: String,
+    /// Inkling: 考えなしの依頼でも、プロンプトがこの語数を超えるか文書（documents）を載せていれば考えを入れる（0 で切る）。
+    /// 考えなしの Inkling は長い文書の答えを「文書に書かれていない」と断るため（notes/inkling2.md 6 節・28 中 15 本）
+    pub ink_nothink_floor_tokens: usize,
+    /// そのとき入れる effort（既定 low）
+    pub ink_nothink_floor_effort: String,
+    /// そのときの考えの上限（語）。答えの上限 max_tokens はこの分だけ足す（考えで答えが切れないように）
+    pub ink_nothink_floor_budget: usize,
     /// llama.cpp と同じく FIM の 3 語（<|fim_pad|>・<|repo_name|>・<|file_sep|>）でも止める
     pub fim_stops: bool,
     /// SSE の keep-alive（読み込みが長い間も切れないように）
@@ -92,6 +100,8 @@ pub struct ServerConfig {
     pub stall_timeout: Duration,
     /// /metrics にも admin の鍵を求める（既定は鍵なし＝127.0.0.1 の Prometheus 用）
     pub metrics_key: bool,
+    /// 頭の使い回しを利用者ごとに分けるアカウント（x-tachyon-prefix-owner を読む。空なら誰の札も読まない＝前と同じ）
+    pub prefix_owner_accounts: Vec<String>,
     /// SIGTERM の後、走っている依頼が自分で終わるのを待つ間（過ぎたら取り消す）
     pub shutdown_grace: Duration,
     /// SIGTERM からこれだけ経ったら、何が残っていても終わる（systemd の止めを 10 秒以内に）
@@ -119,6 +129,9 @@ impl Default for ServerConfig {
             max_images: 8,
             max_image_bytes: 16 << 20,
             default_effort: "medium".into(),
+            ink_nothink_floor_tokens: 4096,
+            ink_nothink_floor_effort: "low".into(),
+            ink_nothink_floor_budget: 2048,
             fim_stops: true,
             keepalive_secs: 15,
             max_documents_per_account: 64,
@@ -127,6 +140,7 @@ impl Default for ServerConfig {
             probe_cache: Duration::from_secs(5),
             stall_timeout: Duration::from_secs(120),
             metrics_key: false,
+            prefix_owner_accounts: vec![],
             shutdown_grace: Duration::from_secs(2),
             exit_deadline: Duration::from_secs(8),
         }
@@ -190,8 +204,13 @@ impl AppState {
     }
 
     pub fn new(cfg: ServerConfig, backend: Arc<dyn Backend>, tok: Arc<Tokenizer>, tpl: Arc<ChatTemplate>, auth: Auth, log: LogSink) -> Result<Arc<Self>, String> {
-        if !EFFORTS.contains(&cfg.default_effort.as_str()) {
-            return Err(format!("default_effort は {} のどれか", EFFORTS.join("・")));
+        if !efforts().contains(&cfg.default_effort.as_str()) {
+            return Err(format!("default_effort は {} のどれか", efforts().join("・")));
+        }
+        if tok.ink.is_some() && cfg.ink_nothink_floor_tokens > 0
+            && (!crate::template::effort_ok(&cfg.ink_nothink_floor_effort) || crate::template::ink_effort_is_none(&cfg.ink_nothink_floor_effort))
+        {
+            return Err(format!("--ink-nothink-floor-effort は none 以外の {} のどれか", efforts().join("・")));
         }
         if cfg.weights_sha.len() < 8 || !cfg.weights_sha.bytes().all(|c| c.is_ascii_hexdigit()) {
             return Err("weights_sha は 16 進（8 桁以上）".into());

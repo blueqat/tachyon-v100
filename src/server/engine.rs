@@ -303,6 +303,12 @@ fn run(loader: EngineLoader, cfg: SchedConfig, rx: smpsc::Receiver<Cmd>, sh: Arc
     let mut eng = match loader(&progress) {
         Ok(e) => e,
         Err(m) => {
+            // 読み込みの失敗（--max-vram-gib を超えた等）は /health 500 のまま口が生き続ける＝systemd は「動いている」と見て起こし直さない
+            // （11-13 に --max-vram-gib 24 の 27B が 7 分 /health を待たせたのはこれ）。TACHYON_EXIT_ON_LOAD_FAIL=1 なら 71 で終わる＝Restart=on-failure が拾う
+            eprintln!("{}", serde_json::json!({"ev": "engine_load_failed", "error": m}));
+            if std::env::var("TACHYON_EXIT_ON_LOAD_FAIL").is_ok_and(|v| v == "1") {
+                super::util::hard_exit(71);
+            }
             *sh.status.lock().unwrap() = Status::Failed(m);
             return;
         }
@@ -412,8 +418,8 @@ fn run(loader: EngineLoader, cfg: SchedConfig, rx: smpsc::Receiver<Cmd>, sh: Arc
                 }
                 0
             } else {
-                // 頭の使い回しはアカウントごと（scope.account。社内どうしでも分ける）
-                eng.reuse_hints(next_id, &j.req.scope.account, &j.req.prompt, &j.req.hints).min(j.req.prompt.len() - 1)
+                // 頭の使い回しは持ち主ごと（scope.owner＝アカウント、--prefix-owner-accounts のアカウントは利用者ごと。社内どうしでも分ける）
+                eng.reuse_hints(next_id, &j.req.scope.owner, &j.req.prompt, &j.req.hints).min(j.req.prompt.len() - 1)
             };
             if j.tx.send(GenEvent::Started { cached }).is_err() {
                 eng.release(next_id);
@@ -548,7 +554,7 @@ fn run(loader: EngineLoader, cfg: SchedConfig, rx: smpsc::Receiver<Cmd>, sh: Arc
                     continue;
                 }
                 ItemOut::Logits(l) => match &s.cons {
-                    Some(m) => vec![sampler::prepare_masked(&l, cfg.valid_vocab, &s.sampling, &s.hist, m).draw(sampler::uniform(s.sampling.seed, s.pos as u64), None)],
+                    Some(m) => vec![sampler::prepare_masked(&l, cfg.valid_vocab, &s.sampling, &s.hist, m).pick(&s.sampling, s.pos as u64)],
                     None => vec![sampler::sample(&l, cfg.valid_vocab, &s.sampling, &s.hist, s.pos as u64)],
                 },
                 ItemOut::None => {

@@ -24,7 +24,7 @@ fn main() {
         objs.push(obj);
     }
     // MTP の小さなカーネル（mtp-head）。上の表とは別に置く（ほかの作業が上の表に足しても、ぶつからないように）
-    for src in ["kernels/mtp.cu", "kernels/vision.cu", "kernels/moe.cu", "kernels/sample.cu"] {
+    for src in ["kernels/mtp.cu", "kernels/vision.cu", "kernels/moe.cu", "kernels/sample.cu", "kernels/mhc.cu", "kernels/inkling.cu"] {
         println!("cargo:rerun-if-changed={src}");
         let obj = out.join(PathBuf::from(src).file_stem().unwrap()).with_extension("o");
         let st = Command::new(&nvcc).args(["-O3", "-std=c++17", "-arch=sm_70", "-Xcompiler", "-fPIC"]).args(&extra).args(["-c", src, "-o"]).arg(&obj).status().expect("nvcc が動かない");

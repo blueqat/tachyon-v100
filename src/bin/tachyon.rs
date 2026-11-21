@@ -546,6 +546,34 @@ fn serve_main(rest: Vec<String>) -> i32 {
         argv.extend(["--weights".to_string(), g]);
     }
     let make: tachyon_v100::server::cli::MakeEngine = Box::new(|a: &tachyon_v100::server::cli::ServeArgs| {
+        // Inkling-2（arch inkling2_loop）: 別のエンジン（src/server/ink.rs）
+        let gpath = a.s("gguf").map(String::from).unwrap_or_else(default_gguf);
+        if tachyon_v100::gguf::Model::open(&gpath).map(|g| g.arch() == "inkling2_loop").unwrap_or(false) {
+            let cfg = tachyon_v100::server::ink::InkConfig {
+                gguf: gpath.into(),
+                ctx: a.n("ctx", 32768)?,
+                max_seqs: a.n("max-seqs", 8)?,
+                kv8: a.flag("kv8"),
+                prefix_cache: !a.flag("no-prefix-cache"),
+                prefix_cache_bytes: (a.s("prefix-cache-gib").map(|x| x.parse::<f64>().map_err(|_| "--prefix-cache-gib は数".to_string())).transpose()?.unwrap_or(1.0)
+                    * (1u64 << 30) as f64) as usize,
+                prefix_per_account: a.n("prefix-per-account", 2)?,
+                prefix_min_tokens: a.n("prefix-min-tokens", 256)?,
+                max_vram_gib: a.s("max-vram-gib").map(|s| s.parse::<f64>().map_err(|_| "--max-vram-gib は数".to_string())).transpose()?.unwrap_or(0.0),
+            };
+            return Ok(tachyon_v100::server::ink::loader(cfg));
+        }
+        // RoPE の伸ばし方（--rope-scaling yarn --rope-factor F --rope-orig N）。重みを読む前に決める
+        if let Some(r) = tachyon_v100::attn::set_rope_scaling_from(&|k| a.s(k).map(String::from))? {
+            eprintln!("RoPE: YaRN {r:?}");
+        }
+        if tachyon_v100::attn::set_kv8(a.flag("kv8")) {
+            eprintln!("KV: int8（32 要素ごとの係数・MTP の頭は fp16 のまま）");
+        }
+        // 層の繰り返し（--repeat-layers START:END:N・学習していない繰り返し・枝 relayer）。重みを読む前に決める
+        if let Some((s0, e0, n0)) = tachyon_v100::model::set_repeat_layers(a.s("repeat-layers"))? {
+            eprintln!("層の繰り返し: 層 {s0}..{e0} を合わせて {n0} 回（mHC なし・KV と GDN の状態は実行ごと）");
+        }
         let d = Opt::default();
         let opt = Opt { gemv_max: a.n("gemv-max", d.gemv_max)?, chunk: a.n("chunk", 2048)?, gdn_seq: a.flag("gdn-seq"), check_finite: a.flag("check-finite"), deq_gemm: a.flag("deq-gemm") };
         let cfg = tachyon_v100::server::m1::M1Config {
@@ -579,6 +607,9 @@ fn serve_main(rest: Vec<String>) -> i32 {
                     min_tokens: a.n("host-min-tokens", 2048).unwrap_or(2048),
                     min_avail: (avail * (1u64 << 30) as f64) as usize,
                     node: None,
+                    // 写し 1 回の時間の上限（超えたら RAM の段を休ませる）: --host-budget-ms 200・--host-breaker-secs 600
+                    budget_ms: a.s("host-budget-ms").and_then(|x| x.parse::<f64>().ok()).unwrap_or(200.0),
+                    breaker_secs: a.n("host-breaker-secs", 600).unwrap_or(600) as u64,
                 })
             },
         };
@@ -907,6 +938,17 @@ fn main() {
         tachyon_v100::server::util::hard_exit(serve_main(raw[1..].to_vec()));
     }
     let a = Args::parse();
+    // RoPE の伸ばし方（--rope-scaling yarn --rope-factor F --rope-orig N）。重みを読む前に決める
+    let rs = tachyon_v100::attn::set_rope_scaling_from(&|k| a.s(k).map(String::from)).unwrap_or_else(|e| panic!("{e}"));
+    if let Some(r) = rs {
+        eprintln!("RoPE: YaRN {r:?}");
+    }
+    if tachyon_v100::attn::set_kv8(a.flag("kv8")) {
+        eprintln!("KV: int8（32 要素ごとの係数）");
+    }
+    if let Some((s0, e0, n0)) = tachyon_v100::model::set_repeat_layers(a.s("repeat-layers")).unwrap_or_else(|e| panic!("{e}")) {
+        eprintln!("層の繰り返し: 層 {s0}..{e0} を合わせて {n0} 回（mHC なし・KV と GDN の状態は実行ごと）");
+    }
     match a.cmd.as_str() {
         "generate" => generate(&a),
         "layers" => layers(&a),
@@ -914,7 +956,79 @@ fn main() {
         "spec" => spec_main(&a),
         "vcheck" => vcheck(&a),
         "vision" => vision_main(&a),
+        "nll" => nll_main(&a),
         _ => usage(),
+    }
+}
+
+/// 文の当てやすさ（層の繰り返しの試し・枝 relayer）: tachyon nll --texts <jsonl: {"id","text"}> [--max-tokens 1024] [--json out]
+/// 文ごとに語に分け（特別な語なし）、頭から max-tokens 語までを 1 回のプレフィル（塊ごと）で通し、位置 i の次の語 i+1 の log 確率を手元で（f64 の logsumexp）。
+/// 出力: 文ごとの語の数・NLL の和・各位置の log 確率と 1 位の語（別の設定と位置ごとに比べるため）
+fn nll_main(a: &Args) {
+    let path = a.s("texts").unwrap_or_else(|| usage());
+    let maxt = a.n("max-tokens", 1024);
+    let (_g, mut m) = open_model(a, None);
+    let tok = tokenizer_for(a).expect("tokenizer が無い（--tokenizer <hf の置き場>）");
+    let mut seq = m.new_seq(maxt + 16);
+    let v = m.cfg.vocab;
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let (mut tot_n, mut tot_s) = (0usize, 0f64);
+    let t0 = Instant::now();
+    let mut out = vec![];
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let j: Value = serde_json::from_str(line).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let id = j["id"].as_str().unwrap_or("").to_string();
+        let mut ids = tok.encode_plain(j["text"].as_str().expect("text が無い")).unwrap_or_else(|e| panic!("{id}: {e:?}"));
+        ids.truncate(maxt);
+        if ids.len() < 2 {
+            continue;
+        }
+        seq.reset();
+        let feed = &ids[..ids.len() - 1];
+        let (mut lps, mut ams) = (Vec::with_capacity(feed.len()), Vec::with_capacity(feed.len()));
+        let mut done = 0;
+        for ch in feed.chunks(m.opt.chunk) {
+            m.forward(&mut seq, ch, None);
+            let mut r = 0;
+            while r < ch.len() {
+                let n = (ch.len() - r).min(model::GEMV_B_MAX);
+                m.head(r, n);
+                let am = m.argmax(n);
+                let lg = m.logits(n);
+                // 行ごとの logsumexp を糸に分けて（1 行 248K 語・f64 で足す）
+                let lse: Vec<f64> = std::thread::scope(|sc| {
+                    let hs: Vec<_> = (0..n)
+                        .map(|i| {
+                            let row = &lg[i * v..(i + 1) * v];
+                            sc.spawn(move || {
+                                let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                                let se: f64 = row.iter().map(|&x| (x - mx).exp() as f64).sum();
+                                mx as f64 + se.ln()
+                            })
+                        })
+                        .collect();
+                    hs.into_iter().map(|h| h.join().unwrap()).collect()
+                });
+                for i in 0..n {
+                    let tgt = ids[done + r + i + 1] as usize;
+                    lps.push(lg[i * v + tgt] as f64 - lse[i]);
+                    ams.push(am[i]);
+                }
+                r += n;
+            }
+            done += ch.len();
+        }
+        let s: f64 = -lps.iter().sum::<f64>();
+        tot_n += lps.len();
+        tot_s += s;
+        eprintln!("{id}: {} 語・NLL {:.4}/語", lps.len(), s / lps.len() as f64);
+        out.push(json!({"id": id, "n": lps.len(), "nll": s, "lp": lps.iter().map(|x| (x * 1e4).round() / 1e4).collect::<Vec<_>>(), "am": ams, "tgt": ids[1..].to_vec()}));
+    }
+    let secs = t0.elapsed().as_secs_f64();
+    eprintln!("計: {tot_n} 語・NLL {:.5}/語・PPL {:.4}・{secs:.1}s", tot_s / tot_n.max(1) as f64, (tot_s / tot_n.max(1) as f64).exp());
+    let r = json!({"n": tot_n, "nll": tot_s, "nll_per_tok": tot_s / tot_n.max(1) as f64, "seconds": secs, "repeat": format!("{:?}", model::repeat_layers()), "docs": out});
+    if let Some(p) = a.s("json") {
+        std::fs::write(p, serde_json::to_string(&r).unwrap()).unwrap();
     }
 }
 

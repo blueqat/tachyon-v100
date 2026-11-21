@@ -6,15 +6,25 @@ NVIDIA V100（sm_70）向けに手書きのCUDAカーネルを実装した、Rus
 
 ## ステータス
 
-リサーチプレビューです。
+研究プレビューです。現在のリリース: **Tachyon V100 Loop**（ループ型トランスフォーマーモデルを追加、[Loopモデル](#loopモデルtachyon-v100-loop)を参照）。
+
+### Tachyon V100 Loopでの変更点
+
+- Loopモデル: SenseNova-Loop-9B（`sensenova_loop`）とInkling-2-Mini（`inkling2_loop`）。`--repeat-layers`（研究用オプション、デフォルトではオフ）
+- `--kv8`: int8 KVキャッシュ（32要素スケール、MTPヘッドはfp16のまま）
+- YaRN RoPEスケーリング（`--rope-scaling yarn --rope-factor F --rope-orig N`、またはGGUFの`rope.scaling.*`キーから指定）
+- 信頼済みプロキシ背後でのエンドユーザーごとのプレフィックスキャッシュ所有者（`--prefix-owner-accounts`、ヘッダー`x-tachyon-prefix-owner`、デフォルトではオフ）
+  自前のプロキシだけが鍵を持つアカウントだけを登録し、ヘッダーはそのプロキシ自身が設定（上書き）してください。そのアカウントでヘッダーを送れるクライアントは、誰のキャッシュを共有するかを選べてしまいます
+- MTPドラフトとターゲットで共有されるシード付きサンプリングノイズ（`TACHYON_HASH_RNG`、デフォルトではオフ）、RAMプレフィックスティアの修正
+- Qwen3.8-27BとQwen3.6-35B-A3B: 社内のゴールデンプロンプト12本（greedy・64トークン、プレフィル経路での教師強制による上位20のlogprob）で、ループ対応を入れる前のエンジンとビット単位で同一の出力
 
 ## V100を選ぶ理由
 
-V100はvLLM >= 0.20でサポートが打ち切られており、FlashAttention 2/3はsm_80を要求します。V100にはbf16がなく、int8/fp8テンソルコアもなく、`cp.async`もありません。Tachyon-v100は独自のfp16カーネル（Volta `mma`）、独自のFA1スタイルのタイルドアテンション、そしてGGUFブロックを直接読み取る量子化GEMVを提供します。
+V100はvLLM >= 0.20でサポートが打ち切られており、FlashAttention 2/3もV100に対応していません。V100にはbf16がなく、int8/fp8テンソルコアもなく、`cp.async`もありません。Tachyon-v100は独自のfp16カーネル（Volta `mma`）、独自のFA1スタイルのタイルドアテンション、そしてGGUFブロックを直接読み取る量子化GEMVを提供します。
 
 ## 対応モデル
 
-モデルごとのページ（取り方・ベンチ・ライセンス）: [docs/models/qwen3.8-27b.md](docs/models/qwen3.8-27b.md)・[docs/models/qwen3.6-35b-a3b.md](docs/models/qwen3.6-35b-a3b.md)
+モデルごとのページ（取り方・ベンチ・ライセンス）: [docs/models/qwen3.8-27b.md](docs/models/qwen3.8-27b.md)・[docs/models/qwen3.6-35b-a3b.md](docs/models/qwen3.6-35b-a3b.md)・[docs/models/sensenova-loop-9b.md](docs/models/sensenova-loop-9b.md)・[docs/models/inkling-2-mini.md](docs/models/inkling-2-mini.md)（Loopモデルは下記）
 
 | モデル | GGUFファイル | 備考 |
 |---|---|---|
@@ -22,6 +32,47 @@ V100はvLLM >= 0.20でサポートが打ち切られており、FlashAttention 2
 | Qwen3.6-35B-A3B | `ggml-org/Qwen3.6-35B-A3B-GGUF` Q4_K_M + `mtp-Qwen3.6-35B-A3B-Q8_0` + mmproj（F16。Q8_0のmmprojは`tools/mmproj_to_f16.py`で変換） | MoE 256エキスパート top-8 + 共有エキスパート、同一のGDN/アテンションブロック、MTPヘッド |
 
 llama.cppエコシステムの無改造GGUFを読み込みます。
+
+## Loopモデル（Tachyon V100 Loop）
+
+ループ型トランスフォーマーは、レイヤースタックの一部をトークンごとに共有ウェイトで複数回実行します。TachyonはウェイトをVRAMに1回だけ保持し、各実行に独自のKVキャッシュとリカレント状態を割り当てるため、プレフィル、CUDA Graphデコード、MTP、プレフィックスキャッシュ、バッチ処理がそのまま動作します。
+アーキテクチャの詳細: [docs/LOOP.md](docs/LOOP.md)。
+
+| モデル | ウェイト（上流からダウンロード。ここでは再配布していません） | ループ | ページ |
+|---|---|---|---|
+| SenseNova-Loop-9B | [sensenova/SenseNova-Loop-9B-GGUF](https://huggingface.co/sensenova/SenseNova-Loop-9B-GGUF) Q4_K_MまたはQ8_0（MTPヘッドを内包）+ mmproj-F16。トークナイザーは[sensenova/SenseNova-Loop-9B-AWQ](https://huggingface.co/sensenova/SenseNova-Loop-9B-AWQ)から | レイヤー4..27をx2 = 56回実行、ツーストリームmHC（トークンごとのSinkhornミキシング） | [docs/models/sensenova-loop-9b.md](docs/models/sensenova-loop-9b.md) |
+| Inkling-2-Mini | [ggml-org/Inkling-2-Mini-GGUF](https://huggingface.co/ggml-org/Inkling-2-Mini-GGUF) IQ4_NL（ggml-orgによる公式ウェイトのGGUF変換、アーキテクチャ`inkling2_loop`）。トークナイザーは[thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)から | MoE 128エキスパートtop-8。レイヤー6..17をx3 = 48回実行、depth-attentionキャリー付きのリスタートパス。RoPEなし（学習済み位置バイアス） | [docs/models/inkling-2-mini.md](docs/models/inkling-2-mini.md) |
+
+Inkling-2-Miniは[Thinking Machines Model Acceptable Use Policy](https://thinkingmachines.ai/model-acceptable-use-policy/)の対象でもあります（モデルを使用することで本ポリシーに同意したものとみなされます。他者にデプロイする場合、あなたはその利用者のコンプライアンスに責任を負い、必要な場合には既知の制限事項およびAIと対話していることをユーザーに伝えなければならず、財務、法務、雇用、医療、住宅、保険、社会サービスに関する決定など、人の権利に影響を与える自動意思決定に本モデルを使用してはなりません）。モデルページを参照してください（ポリシーの原文は英語で、英語版が正文です）。
+
+```sh
+# SenseNova-Loop-9B (Apache-2.0)
+huggingface-cli download sensenova/SenseNova-Loop-9B-GGUF SenseNova-Loop-9B-Q4_K_M.gguf mmproj-SenseNova-Loop-9B-F16.gguf --local-dir weights/loop9b
+huggingface-cli download sensenova/SenseNova-Loop-9B-AWQ tokenizer.json tokenizer_config.json chat_template.jinja --local-dir weights/loop9b/hf
+CUDA_VISIBLE_DEVICES=0 target/release/tachyon serve --gguf weights/loop9b/SenseNova-Loop-9B-Q4_K_M.gguf --hf weights/loop9b/hf \
+  --mmproj weights/loop9b/mmproj-SenseNova-Loop-9B-F16.gguf --draft-vocab data/draft_vocab_q38.txt \
+  --model-name sensenova-loop-9b --keys keys.json --host 127.0.0.1 --port 8080
+
+# Inkling-2-Mini (Apache-2.0 + Model AUP)
+huggingface-cli download ggml-org/Inkling-2-Mini-GGUF Inkling-2-Mini-IQ4_NL.gguf --local-dir weights/inkling2mini
+huggingface-cli download thinkingmachines/Inkling-2-Mini tokenizer.json tokenizer_config.json chat_template.jinja --local-dir weights/inkling2mini/hf
+CUDA_VISIBLE_DEVICES=0 target/release/tachyon serve --gguf weights/inkling2mini/Inkling-2-Mini-IQ4_NL.gguf --hf weights/inkling2mini/hf \
+  --model-name inkling-2-mini --kv8 --keys keys.json --host 127.0.0.1 --port 8080 --ctx 32768 --max-seqs 8 --max-running 8
+```
+
+
+
+検証済みの数値（Tesla V100-SXM3-32GB 1台、CUDA 12.5、temperature 0。予備的な社内測定値であり、詳細と条件はモデルページに記載）:
+
+| | SenseNova-Loop-9B Q4_K_M | Inkling-2-Mini IQ4_NL |
+|---|---|---|
+| CPU f32の公式コードに対するTop-1一致率（5プロンプト） | Q8_0で107/107（Q4_K_Mで101/107） | 104/107（97.2%） |
+| デコード、1ユーザー、ドラフトなし | 55 tok/s | 62-64 tok/s |
+| MTPありデコード | 98 tok/s（k=3） | —（ドラフトヘッドは未移植） |
+| TTFT、8Kトークンプロンプト | 4.1 s | 6.7 s |
+| 同時ストリーム（合計） | 4 / 8 / 16で197 / 296 / 391 tok/s | 4 / 8 / 16 / 32で154 / 196 / 238 / 270 tok/s |
+
+制限事項: Inkling-2-Miniのビジョンおよびそのブロックドラフト（MTP）ヘッドはまだ移植されていません。`--repeat-layers START:END:N`（ループ用に学習されていないモデルのレイヤーを繰り返す）は研究用のみに含まれています。Qwen3.8-27Bでは、試した16通り（2〜4回・4〜32層）のすべてで次トークンのNLLが悪化し、推論問題の正答率も下がりました（docs/LOOP.md、セクション4）。
 
 ## 機能
 
@@ -165,5 +216,8 @@ Apache-2.0、Copyright 2026 blueqat Inc. サードパーティライセンスは
 - Qwenチーム
 - unslothおよびggml-orgのGGUF変換
 - Tencent DSpine（設計リファレンス）
+- SenseTime / OpenSenseNova（SenseNova-Loop-9B とその参照コード）
+- Thinking Machines Lab（Inkling-2-Mini）、その参照実装を公開した transformers・llama.cpp の貢献者、ggml-org（GGUF 変換）
+- YASAKANI（下書きと本体で共有するシード付きサンプリングノイズの考え方。NOTICE を参照）
 
 blueqat Inc.により開発されています。

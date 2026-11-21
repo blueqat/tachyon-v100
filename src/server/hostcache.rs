@@ -33,6 +33,9 @@ pub struct HostCacheConfig {
     pub min_avail: usize,
     /// 固定する RAM を置く NUMA の node（GPU の近く）
     pub node: Option<i32>,
+    /// 写し 1 回（控えを取る・戻す）がこれを超えたら、RAM の段を breaker_secs 止める（ミリ秒）
+    pub budget_ms: f64,
+    pub breaker_secs: u64,
 }
 
 /// 同じ大きさの物を並べる置き場（固定した RAM。足りなくなったら塊ごとに広げる）
@@ -68,7 +71,7 @@ impl Pool {
     }
     fn grow(&mut self, node: Option<i32>) {
         let c = self.chunks.len();
-        self.chunks.push(HostArena::new(self.chunk_bytes(), node));
+        self.chunks.push(HostArena::new_opts(self.chunk_bytes(), node, false));
         // 番号の小さい物から使う（pop は後ろから）
         self.free.extend(((c * self.per_chunk) as u32..((c + 1) * self.per_chunk) as u32).rev());
     }
@@ -119,7 +122,19 @@ pub struct HostCache {
     n_skipped: u64,
     last_restore_ms: f64,
     last_save_ms: f64,
+    max_save_ms: f64,
+    max_restore_ms: f64,
+    /// 写し専用の流れ（計算の流れ・既定の流れを待たない）
+    stream: Stream,
+    /// 遅い写しのあと、この時まで RAM の段を使わない
+    off_until: Option<Instant>,
+    n_breaker: u64,
+    prealloc_secs: f64,
 }
+
+#[derive(Clone, Copy)]
+struct Stream(*mut std::ffi::c_void);
+unsafe impl Send for Stream {}
 
 fn log(v: Value) {
     let mut v = v;
@@ -156,29 +171,62 @@ fn mem_available() -> Option<usize> {
     Some(kb * 1024)
 }
 
-/// GPU と RAM の間のまとめた写し（kv_copy・1 回の起動で何百でも。終わるまで待つ）
-fn copy_all(d: &[kf::CopyDesc]) -> Result<(), String> {
+/// GPU と RAM の間のまとめた写し（kv_copy・1 回の起動で何百でも）。写し専用の流れに積み、その流れだけを待つ
+/// （⛔ cudaDeviceSynchronize にしない: ほかの人のデコード・プレフィルの終わりまで待ってしまう）
+fn copy_all(d: &[kf::CopyDesc], s: Stream) -> Result<(), String> {
     if d.is_empty() {
         return Ok(());
     }
-    let r = unsafe { kf::kv_copy(d.as_ptr(), d.len() as i32, 0, std::ptr::null_mut()) };
+    let r = unsafe { kf::kv_copy(d.as_ptr(), d.len() as i32, 0, s.0) };
     if r != 0 {
         return Err(format!("kv_copy {r}"));
     }
-    crate::cuda::sync();
+    let r = unsafe { kf::cudaStreamSynchronize(s.0) };
+    if r != 0 {
+        return Err(format!("cudaStreamSynchronize {r}"));
+    }
     Ok(())
 }
 
 impl HostCache {
     /// frame_bytes = 1 頁ぶんの KV（全部の Attention の層の K・V ＋ MTP）。st = (GDN の状態, conv, h) のバイト
     pub fn new(cfg: HostCacheConfig, frame_bytes: usize, st: (usize, usize, usize)) -> Self {
-        // 塊は 256MB 前後（広げる手間と、上限の細かさの間）
-        let fpc = ((256usize << 20) / frame_bytes.max(1)).max(16);
+        let t0 = Instant::now();
+        let mut cfg = cfg;
+        // ⭐ 起動のときに全部取って固定する（⛔ 走っている間にページを取らない・固定しない: 2026-11-14 本番で 1 回 25〜136 秒止まった）。
+        //    RAM の空きが min_avail を割るなら、その分だけ小さくする
+        if let Some(a) = mem_available() {
+            let room = a.saturating_sub(cfg.min_avail);
+            if room < cfg.cap_bytes {
+                log(json!({"ev": "prefix_host_shrink", "cap_gib": cfg.cap_bytes >> 30, "to_gib": room >> 30}));
+                cfg.cap_bytes = room;
+            }
+        }
+        // 塊は 1GiB 前後。頁と状態は半々（17K 語の手番で 頁 約 380MB・状態 6 つ 約 380MB）
         let st_item = st.0 + st.1 + st.2;
-        let spc = ((512usize << 20) / st_item.max(1)).max(2);
+        let fpc = ((1usize << 30) / frame_bytes.max(1)).max(16);
+        let spc = ((1usize << 30) / st_item.max(1)).max(2);
+        let mut frames = Pool::new(frame_bytes, fpc);
+        let mut states = Pool::new(st_item, spc);
+        let half = cfg.cap_bytes / 2;
+        while frames.bytes() + frames.chunk_bytes() <= half {
+            frames.grow(cfg.node);
+        }
+        while states.bytes() + states.chunk_bytes() <= cfg.cap_bytes - frames.bytes() {
+            states.grow(cfg.node);
+        }
+        let mut sp: *mut std::ffi::c_void = std::ptr::null_mut();
+        let r = unsafe { kf::cudaStreamCreateWithFlags(&mut sp, 1) };
+        assert!(r == 0, "cudaStreamCreateWithFlags {r}");
         let hc = HostCache {
-            frames: Pool::new(frame_bytes, fpc),
-            states: Pool::new(st_item, spc),
+            frames,
+            states,
+            max_save_ms: 0.0,
+            max_restore_ms: 0.0,
+            stream: Stream(sp),
+            off_until: None,
+            n_breaker: 0,
+            prealloc_secs: t0.elapsed().as_secs_f64(),
             cfg,
             frame_bytes,
             st,
@@ -193,8 +241,31 @@ impl HostCache {
             last_restore_ms: 0.0,
             last_save_ms: 0.0,
         };
+        log(json!({"ev": "prefix_host_ready", "ram_gib": (hc.bytes() as f64 / (1u64 << 30) as f64 * 100.0).round() / 100.0,
+                   "frames": hc.frames.free.len(), "states": hc.states.free.len(), "secs": (hc.prealloc_secs * 10.0).round() / 10.0}));
         hc.publish();
         hc
+    }
+
+    /// 遅い写しの後の休み中か（休み中は当てない・取らない＝ふつうのプレフィル）
+    pub fn paused(&mut self) -> bool {
+        match self.off_until {
+            Some(t) if Instant::now() < t => true,
+            Some(_) => {
+                self.off_until = None;
+                self.publish();
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn check_budget(&mut self, what: &str, ms: f64) {
+        if ms > self.cfg.budget_ms {
+            self.off_until = Some(Instant::now() + std::time::Duration::from_secs(self.cfg.breaker_secs));
+            self.n_breaker += 1;
+            log(json!({"ev": "prefix_host_breaker", "what": what, "ms": (ms * 10.0).round() / 10.0, "budget_ms": self.cfg.budget_ms, "off_secs": self.cfg.breaker_secs}));
+        }
     }
 
     pub fn every(&self) -> usize {
@@ -216,6 +287,15 @@ impl HostCache {
             .filter(|(_, c)| (c.public || c.scope == scope) && c.toks.len() < prompt.len() && prompt.starts_with(&c.toks))
             .max_by_key(|(_, c)| c.toks.len())
             .map(|(i, c)| (i, c.toks.len()))
+    }
+
+    /// 札（pinned）ごとに、プロンプトと頭から同じ語の数（当たらなかった理由を見るため。⛔ 語そのものは出さない）
+    pub fn pin_lcp(&self, prompt: &[u32]) -> Vec<(String, usize, usize)> {
+        self.ckpts
+            .iter()
+            .filter(|c| c.pinned)
+            .map(|c| (c.name.clone().unwrap_or_default(), c.toks.iter().zip(prompt).take_while(|(a, b)| a == b).count(), c.toks.len()))
+            .collect()
     }
 
     pub fn toks(&self, idx: usize) -> &[u32] {
@@ -259,7 +339,10 @@ impl HostCache {
         d.push(kf::CopyDesc { src: sdev, dst: state[0].0, bytes: self.st.0 as u64 });
         d.push(kf::CopyDesc { src: unsafe { sdev.add(self.st.0) }, dst: state[1].0, bytes: self.st.1 as u64 });
         d.push(kf::CopyDesc { src: unsafe { sdev.add(self.st.0 + self.st.1) }, dst: h.0, bytes: self.st.2 as u64 });
-        copy_all(&d)?;
+        copy_all(&d, self.stream)?;
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        self.max_restore_ms = self.max_restore_ms.max(ms);
+        self.check_budget("restore", ms);
         self.tick += 1;
         let c = &mut self.ckpts[idx];
         c.used = self.tick;
@@ -324,16 +407,7 @@ impl HostCache {
             if got.is_some() {
                 return got;
             }
-            let more = if frames { self.frames.chunk_bytes() } else { self.states.chunk_bytes() };
-            let room = self.bytes() + more <= self.cfg.cap_bytes && mem_available().map_or(true, |a| a >= self.cfg.min_avail + more);
-            if room {
-                if frames {
-                    self.frames.grow(self.cfg.node);
-                } else {
-                    self.states.grow(self.cfg.node);
-                }
-                continue;
-            }
+            // ⛔ 走っている間は広げない（起動のときに全部取ってある）
             if !self.evict_one() {
                 return None;
             }
@@ -346,7 +420,7 @@ impl HostCache {
                 state: [(*mut u8, usize); 2], h: (*mut u8, usize)) -> Result<bool, String> {
         let t0 = Instant::now();
         let l = toks.len();
-        if l == 0 || self.cfg.cap_bytes == 0 {
+        if l == 0 || self.cfg.cap_bytes == 0 || self.paused() {
             return Ok(false);
         }
         if self.touch_same(scope, public, toks) {
@@ -438,7 +512,7 @@ impl HostCache {
         d.push(kf::CopyDesc { src: state[0].0, dst: sdev, bytes: self.st.0 as u64 });
         d.push(kf::CopyDesc { src: state[1].0, dst: unsafe { sdev.add(self.st.0) }, bytes: self.st.1 as u64 });
         d.push(kf::CopyDesc { src: h.0, dst: unsafe { sdev.add(self.st.0 + self.st.1) }, bytes: self.st.2 as u64 });
-        if let Err(e) = copy_all(&d) {
+        if let Err(e) = copy_all(&d, self.stream) {
             for (_, f) in new_pages {
                 self.frames.give(f);
             }
@@ -472,6 +546,9 @@ impl HostCache {
         });
         self.n_saved += 1;
         self.last_save_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        self.max_save_ms = self.max_save_ms.max(self.last_save_ms);
+        let sm = self.last_save_ms;
+        self.check_budget("save", sm);
         log(json!({"ev": "prefix_host_save", "tokens": l, "new_pages": new_pages.len(), "public": public, "pinned": pinned,
                                          "ms": (self.last_save_ms * 10.0).round() / 10.0, "ckpts": self.ckpts.len()}));
         self.publish();
@@ -507,6 +584,9 @@ impl HostCache {
             "saved": self.n_saved, "restored": self.n_restored, "restored_tokens": self.restored_tokens,
             "evicted": self.n_evicted, "skipped": self.n_skipped,
             "last_restore_ms": (self.last_restore_ms * 10.0).round() / 10.0, "last_save_ms": (self.last_save_ms * 10.0).round() / 10.0,
+            "max_save_ms": (self.max_save_ms * 10.0).round() / 10.0, "max_restore_ms": (self.max_restore_ms * 10.0).round() / 10.0,
+            "paused": self.off_until.is_some_and(|t| Instant::now() < t), "breaker_trips": self.n_breaker, "budget_ms": self.cfg.budget_ms,
+            "prealloc_secs": (self.prealloc_secs * 10.0).round() / 10.0, "thp": false,
             "frame_kib": self.frames.item / 1024, "state_mib": (st_item as f64 / (1u64 << 20) as f64 * 10.0).round() / 10.0,
         })
     }

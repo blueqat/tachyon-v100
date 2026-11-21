@@ -11,10 +11,13 @@ Tachyon-v100 itself is licensed under Apache-2.0 (see `LICENSE`). It contains or
 | Model math matched to llama.cpp graphs (qwen35 / qwen35moe layers, MoE routing, MTP, Qwen3-VL vision tower, json-schema key order) | `kernels/*.cu`, `src/*.rs`, `src/server/jsonc.rs` | llama.cpp `src/models/*`, `tools/mtmd/*`, `common/json-schema-to-grammar.cpp` | MIT (as above) | written independently against the same equations and checked numerically; no code copied (see the comments in each file) |
 | Qwen3.8-27B chat template (test fixture) | `tests/data/qwen38/chat_template.jinja` | Qwen/Qwen3.8-27B on Hugging Face | Apache-2.0, Copyright 2026 Alibaba Cloud | unmodified copy |
 | Oniguruma regex library (bundled C sources inside the `onig_sys` crate, statically linked via `tokenizers` feature `onig`) | (crate) | github.com/kkos/oniguruma | BSD-2-Clause | ship its copyright notice with binaries |
+| SenseNova-Loop official code (reference only) | `src/model.rs` (`LoopCfg`), `kernels/mhc.cu`; `tools/loop_ref.py` runs it | github.com/OpenSenseNova/SenseNova-Loop (e19d541), OpenSenseNova/llama.cpp (24ea7bb, GGUF layout) | Apache-2.0 (SenseTime / OpenSenseNova); llama.cpp fork MIT | written independently against the same equations, checked numerically; no code copied |
+| Inkling-2-Mini reference implementations (reference only) | `src/inkling.rs`, `kernels/inkling.cu`; `tools/ink_ref.py` runs it | transformers PR #51050, llama.cpp PR #32694 | Apache-2.0 (transformers), MIT (llama.cpp) | written independently, checked numerically; no code copied |
+| YASAKANI (ideas only) | `src/mtp.rs`, `kernels/mtp.cu`, `src/server/sampler.rs` (TACHYON_HASH_RNG, TACHYON_HCAP_SHADOW) | github.com/yasakani-dev/yasakani docs/TECHNOLOGY.md 5.3 | Apache-2.0 | own implementation of the described idea; no code copied |
 | Tencent DSpine architecture (reference only) | `src/spec.rs` (draft interface), docs | github.com/Tencent/DSpine | Apache-2.0 | design reference; no code copied |
 
 Tools that are *linked or called at runtime* but not shipped: llama.cpp (MIT, `tools/lcpp_*.cpp` build against it),
-Python `gguf` (MIT), `numpy` (BSD-3-Clause), `tokenizers` (Apache-2.0), `jinja2` (BSD-3-Clause), `requests` (Apache-2.0), `aiohttp` (Apache-2.0 AND MIT).
+Python `gguf` (MIT), `numpy` (BSD-3-Clause), `torch` (BSD-3-Clause), `transformers` (Apache-2.0), `safetensors` (Apache-2.0), `tokenizers` (Apache-2.0), `jinja2` (BSD-3-Clause), `requests` (Apache-2.0), `aiohttp` (Apache-2.0 AND MIT).
 CUDA runtime (`libcudart`) is linked dynamically and is covered by the NVIDIA CUDA EULA; it is not redistributed.
 
 ### MIT License (ggml / llama.cpp)

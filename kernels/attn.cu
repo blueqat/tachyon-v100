@@ -90,7 +90,24 @@ struct AttnRopeParams {
     int32_t sections[4];
     int32_t pos_mode, kv8;
     float eps, theta;
+    // YaRN（src/attn.rs の Yarn）。freq_scale 1・ext_factor 0・mscale 1 なら前と同じ式（ビットまで同じ）
+    float freq_scale, ext_factor, mscale, corr0, corr1;
 };
+
+// YaRN の角度と大きさ（ggml-cuda の rope_yarn と同じ式。i は組の番号 = ggml の i0/2）
+static __device__ __forceinline__ void rope_yarn_cs(float theta_extrap, int i, float freq_scale, float ext_factor, float mscale, float corr0,
+                                             float corr1, float* cs, float* sn) {
+    const float theta_interp = freq_scale * theta_extrap;
+    float theta = theta_interp;
+    if (ext_factor != 0.0f) {
+        const float y = (float(i) - corr0) / fmaxf(0.001f, corr1 - corr0);
+        const float ramp_mix = (1.0f - fminf(1.0f, fmaxf(0.0f, y))) * ext_factor;
+        theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
+    *cs = cosf(theta) * mscale;
+    *sn = sinf(theta) * mscale;
+}
 
 namespace {
 
@@ -137,6 +154,7 @@ __global__ void __launch_bounds__(256) rope_norm_kernel(const AttnRopeParams a, 
         for (int e = 0; e < 8; ++e) xp[e] = __shfl_sync(0xffffffff, x[e], partner);
         if (rot) {
             const bool first = lane < hl;
+            const bool yarn = a.freq_scale != 1.0f || a.ext_factor != 0.0f || a.mscale != 1.0f;
             const int sect = a.sections[0] + a.sections[1] + a.sections[2] + a.sections[3];
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
@@ -152,7 +170,8 @@ __global__ void __launch_bounds__(256) rope_norm_kernel(const AttnRopeParams a, 
                 const int p = a.pos_mode == 4 ? a.pos[int64_t(t) * 4 + c] : (c == 3 ? 0 : a.pos[t]);
                 const float th = float(p) * powf(theta_scale, float(i));
                 float sn, cs;
-                sincosf(th, &sn, &cs);
+                if (yarn) rope_yarn_cs(th, i, a.freq_scale, a.ext_factor, a.mscale, a.corr0, a.corr1, &cs, &sn);
+                else sincosf(th, &sn, &cs);
                 x[e] = first ? x[e] * cs - xp[e] * sn : xp[e] * sn + x[e] * cs;
             }
         }
